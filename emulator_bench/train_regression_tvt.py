@@ -12,7 +12,13 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 
 import sys
 
@@ -126,7 +132,7 @@ def evaluate_loader(model, loader, device, criterion, target_head, autocast_dtyp
     metadatas = []
     total_loss = 0.0
     total_samples = 0
-    iterator = tqdm(loader, desc=desc, unit="batch", leave=False) if show_progress else loader
+    iterator = progress(loader, desc=desc, unit="batch", leave=False) if show_progress else loader
     with torch.no_grad():
         for batch in iterator:
             batch = _prepare_batch(batch, device)
@@ -169,7 +175,7 @@ def train_one_epoch(
     total_loss = 0.0
     total_samples = 0
     optimizer.zero_grad(set_to_none=True)
-    iterator = tqdm(loader, desc=desc, unit="batch", leave=False)
+    iterator = progress(loader, desc=desc, unit="batch", leave=False)
     optimizer_steps_this_epoch = 0
     total_epochs = getattr(loader, "_bench_total_epochs", None)
     epoch_index = getattr(loader, "_bench_epoch_index", None)
