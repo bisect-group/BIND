@@ -8,7 +8,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from tqdm.auto import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 
 import sys
 
@@ -181,7 +187,7 @@ def cache_proteins(args, sequences):
 
     written = 0
     writer = AsyncNpzWriter(max_workers=args.writer_threads, max_pending=args.max_pending_writes)
-    iterator = tqdm(batches, desc="Caching protein embeddings", unit="batch")
+    iterator = progress(batches, desc="Caching protein embeddings", unit="batch")
     try:
         for batch in iterator:
             embedded = _esm_forward(
@@ -244,7 +250,7 @@ def cache_ligands(args, smiles_values):
 
     written = 0
     failed = []
-    iterator = tqdm(pending, desc="Caching ligand graphs", unit="smiles")
+    iterator = progress(pending, desc="Caching ligand graphs", unit="smiles")
     for smiles in iterator:
         try:
             item = graph_cache_item(smiles)
