@@ -35,7 +35,7 @@ class BindRegressionModel(nn.Module):
         self,
         head_order: List[str] = None,
         cross_attention_dropout: float = 0.1,
-        leaky_relu_negative_slope: float = 0.05,
+        leaky_relu_negative_slope: float = 0.01,
     ):
         super().__init__()
         self.head_order = list(head_order or HEAD_ORDER)
@@ -47,23 +47,23 @@ class BindRegressionModel(nn.Module):
         self.e_embed = nn.Linear(5, 2)
         self.e_embed_ln = nn.LayerNorm(2)
 
-        self.conv1 = gnn.GATv2Conv(16, 64, edge_dim=2, negative_slope=0.05)
+        self.conv1 = gnn.GATv2Conv(16, 64, edge_dim=2, negative_slope=0.01)
         self.ln1 = gnn.LayerNorm(64)
         self.crossattention1 = CrossAttentionGraphModule(num_heads=16, node_feature_size=64, latent_size=1280, dropout=cross_attention_dropout)
 
-        self.conv2 = gnn.GATv2Conv(64, 64, edge_dim=2, negative_slope=0.05)
+        self.conv2 = gnn.GATv2Conv(64, 64, edge_dim=2, negative_slope=0.01)
         self.ln2 = gnn.LayerNorm(64)
         self.crossattention2 = CrossAttentionGraphModule(num_heads=16, node_feature_size=64, latent_size=1280, dropout=cross_attention_dropout)
 
-        self.conv3 = gnn.GATv2Conv(64, 64, edge_dim=2, negative_slope=0.05)
+        self.conv3 = gnn.GATv2Conv(64, 64, edge_dim=2, negative_slope=0.01)
         self.ln3 = gnn.LayerNorm(64)
         self.crossattention3 = CrossAttentionGraphModule(num_heads=16, node_feature_size=64, latent_size=1280, dropout=cross_attention_dropout)
 
-        self.conv4 = gnn.GATv2Conv(64, 64, edge_dim=2, negative_slope=0.05)
+        self.conv4 = gnn.GATv2Conv(64, 64, edge_dim=2, negative_slope=0.01)
         self.ln4 = gnn.LayerNorm(64)
         self.crossattention4 = CrossAttentionGraphModule(num_heads=16, node_feature_size=64, latent_size=1280, dropout=cross_attention_dropout)
 
-        self.conv5 = gnn.GATv2Conv(64, 64, edge_dim=2, negative_slope=0.05)
+        self.conv5 = gnn.GATv2Conv(64, 64, edge_dim=2, negative_slope=0.01)
         self.ln5 = gnn.LayerNorm(64)
 
         self.pool = PoolWrapper(gnn.LCMAggregation(64, 1024))
@@ -76,6 +76,8 @@ class BindRegressionModel(nn.Module):
         self.heads = nn.ModuleDict({head_name: nn.Linear(1024, 1) for head_name in self.head_order})
 
     def forward(self, graph, protein_layers, attention_mask, return_attentions: bool = False) -> Dict[str, torch.Tensor]:
+        # attention_mask covers <cls>, residues and <eos>. return_attention_weights=True selects the
+        # original explicit softmax then dropout path, not the fused kernel.
         padding_mask = ~attention_mask.bool()
         protein_layers = [layer.float() for layer in protein_layers]
 
@@ -93,22 +95,22 @@ class BindRegressionModel(nn.Module):
         x = self.conv1(x, edge_index, edge_features)
         x = self.leaky_relu(x)
         x = self.ln1(x, graph.batch)
-        x, av_attn1 = self.crossattention1(x, graph.batch, protein_layers[0], padding_mask, return_attention_weights=return_attentions)
+        x, av_attn1 = self.crossattention1(x, graph.batch, protein_layers[0], padding_mask, return_attention_weights=True)
 
         x = self.conv2(x, edge_index, edge_features)
         x = self.leaky_relu(x)
         x = self.ln2(x, graph.batch)
-        x, av_attn2 = self.crossattention2(x, graph.batch, protein_layers[1], padding_mask, return_attention_weights=return_attentions)
+        x, av_attn2 = self.crossattention2(x, graph.batch, protein_layers[1], padding_mask, return_attention_weights=True)
 
         x = self.conv3(x, edge_index, edge_features)
         x = self.leaky_relu(x)
         x = self.ln3(x, graph.batch)
-        x, av_attn3 = self.crossattention3(x, graph.batch, protein_layers[2], padding_mask, return_attention_weights=return_attentions)
+        x, av_attn3 = self.crossattention3(x, graph.batch, protein_layers[2], padding_mask, return_attention_weights=True)
 
         x = self.conv4(x, edge_index, edge_features)
         x = self.leaky_relu(x)
         x = self.ln4(x, graph.batch)
-        x, av_attn4 = self.crossattention4(x, graph.batch, protein_layers[3], padding_mask, return_attention_weights=return_attentions)
+        x, av_attn4 = self.crossattention4(x, graph.batch, protein_layers[3], padding_mask, return_attention_weights=True)
 
         x = self.conv5(x, edge_index, edge_features)
         x = self.leaky_relu(x)
@@ -131,7 +133,7 @@ class BindRegressionModel(nn.Module):
 def build_model(
     head_order: List[str] = None,
     cross_attention_dropout: float = 0.1,
-    leaky_relu_negative_slope: float = 0.05,
+    leaky_relu_negative_slope: float = 0.01,
 ):
     return BindRegressionModel(
         head_order=head_order or HEAD_ORDER,

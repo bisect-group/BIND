@@ -11,14 +11,20 @@ import pandas as pd
 import torch
 
 
-DEFAULT_MODEL_NAME = "BIND"
-DEFAULT_BASE_DIR = Path(f"/home/da24s023/github/EMULaToR/data/processed/baselines/{DEFAULT_MODEL_NAME}")
-DEFAULT_EMBEDDINGS_DIR = DEFAULT_BASE_DIR / "embeddings"
-DEFAULT_RESULTS_DIRNAME = "bind_results"
+EMULATOR_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_DATASETS_DIR = EMULATOR_ROOT / "data" / "processed" / "datasets"
+DEFAULT_OUTPUT_DIR = EMULATOR_ROOT / "outputs" / "baselines" / "BIND"
+DEFAULT_EMBEDDINGS_DIR = DEFAULT_OUTPUT_DIR / "embeddings"
+DEFAULT_SEEDS = [666, 777, 888]
+DATASET_PARENTS = {
+    "ki": "kinetic_dataset",
+    "kd": "binding_affinity_dataset",
+    "ic50": "binding_affinity_dataset",
+    "ec50": "binding_affinity_dataset",
+}
 DEFAULT_VALUE_TYPES = ["ki", "kd", "ic50", "ec50"]
 HEAD_ORDER = ["ki", "ic50", "kd", "ec50"]
 DEFAULT_HIDDEN_STATE_INDICES = [0, 10, 20, 30]
-SPECIAL_CHILDREN = {"embeddings", "optuna_studies", "retrain_from_optuna", "bench_summaries"}
 
 
 def stable_hash(text: str) -> str:
@@ -55,7 +61,7 @@ def canonical_value_type(value: str) -> str:
 def model_cache_tag(model_name: str, layer_indices: Sequence[int]) -> str:
     safe_model = str(model_name).replace("/", "_").replace("-", "_")
     layer_tag = "-".join(str(int(index)) for index in layer_indices)
-    return f"{safe_model}_layers_{layer_tag}"
+    return f"{safe_model}_layers_{layer_tag}_cls_eos"
 
 
 def protein_cache_path(embeddings_dir: Path, sequence: str, model_name: str, layer_indices: Sequence[int]) -> Path:
@@ -66,6 +72,14 @@ def protein_cache_path(embeddings_dir: Path, sequence: str, model_name: str, lay
 def ligand_cache_path(embeddings_dir: Path, smiles: str) -> Path:
     key = stable_hash(str(smiles).strip())
     return Path(embeddings_dir) / "ligands" / "graph_v1" / key[:2] / f"{key}.npz"
+
+
+def value_root(datasets_dir: Path, value_type: str) -> Path:
+    return Path(datasets_dir) / DATASET_PARENTS[value_type] / value_type
+
+
+def seed_result_dir(output_dir: Path, job: Dict[str, str], seed: int) -> Path:
+    return Path(output_dir) / job["value_type"] / job["split_group"] / job["split_name"] / f"seed_{seed}"
 
 
 def ensure_parent(path: Path) -> None:
@@ -172,39 +186,25 @@ def _find_split_file(directory: Path, stem: str) -> Optional[Path]:
     return None
 
 
-def discover_value_types(base_dir: Path, value_types: Optional[Iterable[str]] = None) -> List[str]:
-    base_dir = Path(base_dir)
-    if value_types:
-        return [canonical_value_type(value) for value in value_types]
-
-    discovered = []
-    for child in sorted(base_dir.iterdir()):
-        if not child.is_dir() or child.name in SPECIAL_CHILDREN:
-            continue
-        try:
-            discovered.append(canonical_value_type(child.name))
-        except ValueError:
-            continue
-    if not discovered:
-        raise FileNotFoundError(f"No value_type directories found under {base_dir}")
-    return discovered
+def discover_value_types(value_types: Optional[Iterable[str]] = None) -> List[str]:
+    return [canonical_value_type(value) for value in (value_types or DEFAULT_VALUE_TYPES)]
 
 
-def discover_split_groups(value_root: Path, split_groups: Optional[Iterable[str]] = None) -> List[str]:
-    value_root = Path(value_root)
-    if not value_root.exists():
+def discover_split_groups(task_root: Path, split_groups: Optional[Iterable[str]] = None) -> List[str]:
+    task_root = Path(task_root)
+    if not task_root.exists():
         return []
     if split_groups:
         return [str(group) for group in split_groups]
     groups = []
-    for child in sorted(value_root.iterdir()):
-        if child.is_dir() and child.name not in SPECIAL_CHILDREN:
+    for child in sorted(task_root.iterdir()):
+        if child.is_dir():
             groups.append(child.name)
     return groups
 
 
 def discover_split_jobs(
-    base_dir: Path,
+    datasets_dir: Path,
     value_types: Optional[Iterable[str]] = None,
     split_groups: Optional[Iterable[str]] = None,
     thresholds: Optional[Iterable[str]] = None,
@@ -212,12 +212,12 @@ def discover_split_jobs(
     threshold_filter = list(thresholds) if thresholds is not None else None
     jobs: List[Dict[str, str]] = []
 
-    for value_type in discover_value_types(base_dir, value_types=value_types):
-        value_root = Path(base_dir) / value_type
-        if not value_root.exists():
+    for value_type in discover_value_types(value_types):
+        task_root = value_root(datasets_dir, value_type)
+        if not task_root.exists():
             continue
-        for split_group in discover_split_groups(value_root, split_groups=split_groups):
-            group_dir = value_root / split_group
+        for split_group in discover_split_groups(task_root, split_groups=split_groups):
+            group_dir = task_root / split_group
             if not group_dir.exists():
                 continue
 
@@ -228,8 +228,7 @@ def discover_split_jobs(
                 jobs.append(
                     {
                         "value_type": value_type,
-                        "value_root": str(value_root),
-                        "split_group": split_group,
+                                                "split_group": split_group,
                         "split_name": split_group,
                         "difficulty": split_group,
                         "root_dir": str(group_dir),
@@ -261,8 +260,7 @@ def discover_split_jobs(
                 jobs.append(
                     {
                         "value_type": value_type,
-                        "value_root": str(value_root),
-                        "split_group": split_group,
+                                                "split_group": split_group,
                         "split_name": child.name,
                         "difficulty": difficulty,
                         "root_dir": str(child),
@@ -274,13 +272,13 @@ def discover_split_jobs(
     return jobs
 
 
-def resolve_single_split_job(base_dir: Path, value_type: str, split_group: str, threshold: Optional[str] = None) -> Dict[str, str]:
+def resolve_single_split_job(datasets_dir: Path, value_type: str, split_group: str, threshold: Optional[str] = None) -> Dict[str, str]:
     canonical = canonical_value_type(value_type)
     threshold_filter = None if threshold is None else normalize_threshold_args(threshold=threshold)
-    jobs = discover_split_jobs(base_dir, value_types=[canonical], split_groups=[split_group], thresholds=threshold_filter)
+    jobs = discover_split_jobs(datasets_dir, value_types=[canonical], split_groups=[split_group], thresholds=threshold_filter)
     if not jobs:
         detail = f"{canonical}/{split_group}/{threshold}" if threshold else f"{canonical}/{split_group}"
-        raise FileNotFoundError(f"No split job discovered for {detail} in {base_dir}")
+        raise FileNotFoundError(f"No split job discovered for {detail} in {datasets_dir}")
     if threshold is None and len(jobs) == 1:
         return jobs[0]
     if threshold is None:

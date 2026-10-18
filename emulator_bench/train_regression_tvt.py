@@ -13,12 +13,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 import sys
 
@@ -28,10 +28,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from emulator_bench.common import (
-    DEFAULT_BASE_DIR,
+    DEFAULT_DATASETS_DIR,
     DEFAULT_EMBEDDINGS_DIR,
     DEFAULT_HIDDEN_STATE_INDICES,
-    DEFAULT_RESULTS_DIRNAME,
+    DEFAULT_OUTPUT_DIR,
     append_csv_row,
     canonical_value_type,
     normalize_sequence,
@@ -40,10 +40,11 @@ from emulator_bench.common import (
     require_columns,
     resolve_single_split_job,
     save_json,
+    seed_result_dir,
     set_seed,
     truncate_sequence,
 )
-from emulator_bench.dataset import CachedBindDataset, collate_bind_samples
+from emulator_bench.dataset import CachedBindDataset, ReplacementSampler, collate_bind_samples
 from emulator_bench.feature_pipeline import (
     LigandGraphStore,
     PROTEIN_MODEL_NAME,
@@ -100,8 +101,8 @@ def _prepare_batch(batch, device: torch.device):
     return batch.to(device)
 
 
-def _make_loader(dataset, loader_kwargs: dict, shuffle: bool):
-    return DataLoader(dataset, shuffle=shuffle, **loader_kwargs)
+def _make_loader(dataset, loader_kwargs: dict, sampler=None):
+    return DataLoader(dataset, sampler=sampler, **loader_kwargs)
 
 
 def _shutdown_loader(loader) -> None:
@@ -192,7 +193,7 @@ def train_one_epoch(
             if consecutive_bad_batches >= max_consecutive_bad_batches:
                 raise RuntimeError(
                     f"Training aborted: {consecutive_bad_batches} consecutive non-finite loss batches. "
-                    "Consider adding --clip_grad 1.0 or reducing --lr."
+                    "Training diverged."
                 )
             iterator.set_postfix({"loss": "non-finite", "skipped": consecutive_bad_batches})
             continue
@@ -256,10 +257,10 @@ def save_metrics(path: Path, metrics: dict) -> None:
 def _resolve_paths(args):
     if args.train_path and args.val_path and args.test_path:
         return Path(args.train_path), Path(args.val_path), Path(args.test_path), None
-    if not args.base_dir or not args.value_type or not args.split_group:
-        raise ValueError("Provide either explicit --train_path/--val_path/--test_path or --base_dir with --value_type and --split_group.")
+    if not args.value_type or not args.split_group:
+        raise ValueError("Provide either explicit --train_path/--val_path/--test_path or --value_type with --split_group.")
     job = resolve_single_split_job(
-        Path(args.base_dir),
+        Path(args.datasets_dir),
         value_type=args.value_type,
         split_group=args.split_group,
         threshold=args.threshold,
@@ -272,7 +273,7 @@ def _default_out_dir(args, job):
         return Path(args.out_dir)
     if job is None:
         raise ValueError("--out_dir is required when explicit train/val/test paths are used.")
-    return Path(job["root_dir"]) / args.results_dirname / f"seed_{args.seed}"
+    return seed_result_dir(args.output_dir, job, args.seed)
 
 
 def _existing_cache_mask(frame, embeddings_dir, args):
@@ -299,6 +300,7 @@ def _filter_frame(frame, split_name: str, embeddings_dir: Path, args, model_sequ
         & filtered[args.smiles_col].notna()
         & filtered[args.target_col].notna()
     ].copy()
+    rows_dropped_nan = int(len(frame) - len(filtered))
     filtered["original_sequence_length"] = filtered[args.sequence_col].astype(str).map(lambda value: len(normalize_sequence(value)))
     filtered[args.sequence_col] = filtered[args.sequence_col].astype(str).map(lambda value: truncate_sequence(value, args.protein_length_cap))
     filtered[args.smiles_col] = filtered[args.smiles_col].astype(str).map(lambda value: str(value).strip())
@@ -306,10 +308,15 @@ def _filter_frame(frame, split_name: str, embeddings_dir: Path, args, model_sequ
     truncated_rows = int((filtered["sequence_length"] < filtered["original_sequence_length"]).sum())
     if args.long_sequence_strategy == "drop":
         filtered = filtered.loc[filtered["sequence_length"] <= int(model_sequence_limit)].copy()
-    filtered = filtered.loc[_existing_cache_mask(filtered, embeddings_dir, args)].copy()
+    cached = _existing_cache_mask(filtered, embeddings_dir, args)
+    rows_missing_cache = int((~cached).sum())
+    filtered = filtered.loc[cached].copy()
     filtered.reset_index(drop=True, inplace=True)
     return filtered, {
         "split_name": split_name,
+        "rows_input": int(len(frame)),
+        "rows_dropped_nan": rows_dropped_nan,
+        "rows_missing_cache": rows_missing_cache,
         "rows_after_filter": int(len(filtered)),
         "rows_truncated_to_cap": truncated_rows,
         "max_original_sequence_length": int(filtered["original_sequence_length"].max()) if len(filtered) else 0,
@@ -322,7 +329,8 @@ def _filter_frame(frame, split_name: str, embeddings_dir: Path, args, model_sequ
 
 def main():
     parser = argparse.ArgumentParser(description="Train BIND regression on explicit train/val/test split files.")
-    parser.add_argument("--base_dir", type=str, default=str(DEFAULT_BASE_DIR))
+    parser.add_argument("--datasets_dir", type=str, default=str(DEFAULT_DATASETS_DIR))
+    parser.add_argument("--output_dir", type=str, default=str(DEFAULT_OUTPUT_DIR / "bind_results"))
     parser.add_argument("--value_type", type=str, default=None)
     parser.add_argument("--split_group", type=str, default=None)
     parser.add_argument("--threshold", type=str, default=None)
@@ -331,7 +339,6 @@ def main():
     parser.add_argument("--test_path", type=str, default=None)
     parser.add_argument("--embeddings_dir", type=str, default=str(DEFAULT_EMBEDDINGS_DIR))
     parser.add_argument("--out_dir", type=str, default=None)
-    parser.add_argument("--results_dirname", type=str, default=DEFAULT_RESULTS_DIRNAME)
     parser.add_argument("--task_name", type=str, default="bind_regression_retrain")
 
     parser.add_argument("--sequence_col", type=str, default="sequence")
@@ -344,12 +351,12 @@ def main():
     parser.add_argument("--long_sequence_strategy", choices=["drop", "direct", "sliding_window"], default="direct")
 
     parser.add_argument("--cross_attention_dropout", type=float, default=0.1)
-    parser.add_argument("--leaky_relu_negative_slope", type=float, default=0.05)
+    parser.add_argument("--leaky_relu_negative_slope", type=float, default=0.01)
 
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--grad_accumulation_steps", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=11)
-    parser.add_argument("--train_budget_mode", choices=["paper_steps", "fixed_epochs", "fixed_optimizer_steps"], default="fixed_epochs")
+    parser.add_argument("--train_budget_mode", choices=["paper_steps", "fixed_epochs", "fixed_optimizer_steps"], default="paper_steps")
     parser.add_argument("--paper_effective_epochs", type=float, default=PAPER_EFFECTIVE_EPOCHS)
     parser.add_argument("--max_optimizer_steps", type=int, default=100000)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -362,12 +369,12 @@ def main():
     parser.add_argument("--lr_decay_factor", type=float, default=0.5)
     parser.add_argument("--lr_decay_patience", type=int, default=2)
     parser.add_argument("--min_lr", type=float, default=0.0)
-    parser.add_argument("--clip_grad", type=float, default=1.0)
+    parser.add_argument("--clip_grad", type=float, default=0.0)
     parser.add_argument("--huber_delta", type=float, default=2.0)
     parser.add_argument("--patience", type=int, default=0)
     parser.add_argument("--min_delta", type=float, default=0.0)
     parser.add_argument("--monitor_metric", choices=["rmse", "pearson", "spearman", "r2_score", "mae", "mse", "loss"], default="rmse")
-    parser.add_argument("--validate_every_epochs", type=int, default=1)
+    parser.add_argument("--validate_every_epochs", type=int, default=0)
 
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--num_workers", type=int, default=min(16, os.cpu_count() or 1))
@@ -382,14 +389,16 @@ def main():
     parser.add_argument("--torch_compile", action="store_true")
     parser.add_argument("--seed", type=int, default=666)
     parser.add_argument("--no_resume", action="store_true")
+    parser.add_argument("--amp", action="store_true", help="Opt-in bf16 autocast and TF32 on Ampere+ (default: the original fp16 autocast with GradScaler).")
     args = parser.parse_args()
 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
+    if args.amp:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
     if args.num_workers > 0:
         torch.multiprocessing.set_sharing_strategy(args.sharing_strategy)
-    if hasattr(torch, "set_float32_matmul_precision"):
+    if args.amp:
         torch.set_float32_matmul_precision("high")
     if torch.cuda.is_available():
         torch.backends.cuda.enable_flash_sdp(True)
@@ -401,7 +410,10 @@ def main():
     target_head = canonical_value_type(args.target_head or args.value_type or "ki")
 
     device = torch.device(args.device)
-    autocast_dtype, precision_mode = resolve_amp_dtype(device)
+    if device.type == "cuda" and not args.amp:
+        autocast_dtype, precision_mode = torch.float16, "fp16-mixed"  # original train_graph.py: fp16 autocast + GradScaler
+    else:
+        autocast_dtype, precision_mode = resolve_amp_dtype(device, args.amp)
     scaler = torch.amp.GradScaler("cuda", enabled=(autocast_dtype == torch.float16))
 
     train_path, val_path, test_path, job = _resolve_paths(args)
@@ -421,6 +433,15 @@ def main():
     val_df, val_filter = _filter_frame(val_df, "val", embeddings_dir, args, model_sequence_limit)
     test_df, test_filter = _filter_frame(test_df, "test", embeddings_dir, args, model_sequence_limit)
 
+    for info in (train_filter, val_filter, test_filter):
+        print(f"{info['split_name']}: {info['rows_input']} rows, {info['rows_dropped_nan']} NaN, "
+              f"{info['rows_missing_cache']} missing from cache, {info['rows_after_filter']} kept", flush=True)
+    for info in (val_filter, test_filter):
+        if info["rows_missing_cache"]:
+            raise RuntimeError(
+                f"{info['rows_missing_cache']} {info['split_name']} rows are missing from the cache in "
+                f"{embeddings_dir}. Run cache_embeddings.py first."
+            )
     if train_df.empty or val_df.empty or test_df.empty:
         raise RuntimeError("One or more filtered splits are empty after applying cache and sequence-length checks.")
 
@@ -465,7 +486,7 @@ def main():
     eval_loader_kwargs = dict(loader_kwargs)
     eval_loader_kwargs["persistent_workers"] = False
 
-    train_loader = _make_loader(train_dataset, loader_kwargs, shuffle=True)
+    train_loader = _make_loader(train_dataset, loader_kwargs, sampler=ReplacementSampler(len(train_dataset)))
 
     model = build_model(
         cross_attention_dropout=args.cross_attention_dropout,
@@ -509,7 +530,9 @@ def main():
 
     optimizer_steps_completed = 0
     epoch_index = 0
-    if not args.no_resume and last_checkpoint_path.exists():
+    if args.no_resume:
+        log_path.unlink(missing_ok=True)
+    elif last_checkpoint_path.exists():
         _ckpt = torch.load(last_checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(_ckpt["model_state_dict"])
         optimizer.load_state_dict(_ckpt["optimizer_state_dict"])
@@ -551,7 +574,7 @@ def main():
         ) or optimizer_steps_completed >= target_optimizer_steps
         val_metrics = {"loss": float("nan"), args.monitor_metric: float("nan")}
         if should_validate:
-            val_loader = _make_loader(val_dataset, eval_loader_kwargs, shuffle=False)
+            val_loader = _make_loader(val_dataset, eval_loader_kwargs)
             _val_true, _val_pred, val_metrics, _val_metadata = evaluate_loader(
                 model,
                 val_loader,
@@ -651,7 +674,7 @@ def main():
     best_checkpoint = torch.load(best_checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(best_checkpoint["model_state_dict"])
 
-    train_loader = _make_loader(train_dataset, eval_loader_kwargs, shuffle=False)
+    train_loader = _make_loader(train_dataset, eval_loader_kwargs)
     final_train_true, final_train_pred, final_train_metrics, final_train_metadata = evaluate_loader(
         model,
         train_loader,
@@ -663,7 +686,7 @@ def main():
         metric_name=args.monitor_metric,
     )
     _shutdown_loader(train_loader)
-    val_loader = _make_loader(val_dataset, eval_loader_kwargs, shuffle=False)
+    val_loader = _make_loader(val_dataset, eval_loader_kwargs)
     final_val_true, final_val_pred, final_val_metrics, final_val_metadata = evaluate_loader(
         model,
         val_loader,
@@ -675,7 +698,7 @@ def main():
         metric_name=args.monitor_metric,
     )
     _shutdown_loader(val_loader)
-    test_loader = _make_loader(test_dataset, eval_loader_kwargs, shuffle=False)
+    test_loader = _make_loader(test_dataset, eval_loader_kwargs)
     final_test_true, final_test_pred, final_test_metrics, final_test_metadata = evaluate_loader(
         model,
         test_loader,

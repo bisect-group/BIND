@@ -9,12 +9,12 @@ from pathlib import Path
 import numpy as np
 import torch
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 import sys
 
@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from emulator_bench.common import (
-    DEFAULT_BASE_DIR,
+    DEFAULT_DATASETS_DIR,
     DEFAULT_EMBEDDINGS_DIR,
     DEFAULT_HIDDEN_STATE_INDICES,
     DEFAULT_VALUE_TYPES,
@@ -132,7 +132,7 @@ def cache_proteins(args, sequences):
         return {"proteins_total": 0, "proteins_written": 0, "proteins_skipped_long": 0}
 
     device = torch.device(args.device)
-    autocast_dtype, precision_mode = resolve_amp_dtype(device)
+    autocast_dtype, precision_mode = resolve_amp_dtype(device, args.amp)
     model, tokenizer = load_esm2_model(device, model_name=args.protein_model_name)
     model_limit = esm_sequence_limit(model)
     if args.long_sequence_strategy == "drop":
@@ -273,7 +273,7 @@ def cache_ligands(args, smiles_values):
 
 def main():
     parser = argparse.ArgumentParser(description="Cache reusable BIND protein hidden states and ligand graphs.")
-    parser.add_argument("--base_dir", type=str, default=str(DEFAULT_BASE_DIR))
+    parser.add_argument("--datasets_dir", type=str, default=str(DEFAULT_DATASETS_DIR))
     parser.add_argument("--embeddings_dir", type=str, default=str(DEFAULT_EMBEDDINGS_DIR))
     parser.add_argument("--value_types", nargs="+", default=DEFAULT_VALUE_TYPES)
     parser.add_argument("--split_groups", nargs="+", default=None)
@@ -289,7 +289,8 @@ def main():
     parser.add_argument("--max_residues", type=int, default=8192)
     parser.add_argument("--max_batch", type=int, default=8)
     parser.add_argument("--sliding_window_stride", type=int, default=896)
-    parser.add_argument("--protein_dtype", choices=["float16", "float32"], default="float16")
+    parser.add_argument("--protein_dtype", choices=["float16", "float32"], default="float32")
+    parser.add_argument("--amp", action="store_true", help="Opt-in bf16 autocast (default: the original fp16 autocast for training, fp32 ESM-2 caching).")
     parser.add_argument("--writer_threads", type=int, default=max(4, min(16, os.cpu_count() or 4)))
     parser.add_argument("--max_pending_writes", type=int, default=128)
     parser.add_argument("--num_shards", type=int, default=1)
@@ -297,7 +298,7 @@ def main():
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
-    args.base_dir = Path(args.base_dir)
+    args.datasets_dir = Path(args.datasets_dir)
     args.embeddings_dir = Path(args.embeddings_dir)
     args.hidden_state_indices = [int(index) for index in args.hidden_state_indices]
     args.thresholds = normalize_threshold_args(args.thresholds, args.threshold)
@@ -308,13 +309,13 @@ def main():
     args.embeddings_dir.mkdir(parents=True, exist_ok=True)
 
     jobs = discover_split_jobs(
-        args.base_dir,
+        args.datasets_dir,
         value_types=args.value_types,
         split_groups=args.split_groups,
         thresholds=args.thresholds,
     )
     if not jobs:
-        raise FileNotFoundError(f"No split jobs discovered in {args.base_dir}")
+        raise FileNotFoundError(f"No split jobs discovered in {args.datasets_dir}")
 
     started = time.time()
     sequences, smiles_values, truncated_count = _collect_unique_values(
@@ -332,8 +333,8 @@ def main():
     ligand_stats = cache_ligands(args, smiles_values)
 
     manifest = {
-        "cache_version": 1,
-        "base_dir": str(args.base_dir),
+        "cache_version": 2,
+        "datasets_dir": str(args.datasets_dir),
         "embeddings_dir": str(args.embeddings_dir),
         "value_types": list(args.value_types),
         "split_groups": list(args.split_groups) if args.split_groups else None,

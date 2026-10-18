@@ -1,10 +1,11 @@
+import random
 from dataclasses import dataclass
 from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from torch_geometric.data import Batch, Data
 
 from emulator_bench.common import normalize_sequence
@@ -25,6 +26,19 @@ class BindBatch:
         self.targets = self.targets.to(device, non_blocking=True)
         self.protein_layers = [layer.to(device, non_blocking=True) for layer in self.protein_layers]
         return self
+
+
+class ReplacementSampler(Sampler):
+    """Draws len(dataset) rows per epoch with replacement from the global RNG, as the original sampler does."""
+
+    def __init__(self, size: int):
+        self.size = size
+
+    def __len__(self):
+        return self.size
+
+    def __iter__(self):
+        return iter(random.choices(range(self.size), k=self.size))
 
 
 class CachedBindDataset(Dataset):
@@ -95,7 +109,7 @@ def collate_bind_samples(samples: List[Dict]) -> BindBatch:
     targets = []
     protein_items = [sample["protein"] for sample in samples]
     layer_keys = protein_layer_keys(protein_items[0])
-    lengths = [int(item["length"][0]) for item in protein_items]
+    lengths = [item[layer_keys[0]].shape[0] for item in protein_items]
     max_len = max(lengths)
     batch_size = len(samples)
     protein_layers = []

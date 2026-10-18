@@ -31,8 +31,9 @@ def _autocast_context(device: torch.device, dtype=None):
     return nullcontext()
 
 
-def resolve_amp_dtype(device: torch.device):
-    if device.type != "cuda" or not torch.cuda.is_available():
+def resolve_amp_dtype(device: torch.device, amp: bool = False):
+    """fp32 unless amp is set; with amp pick bf16 on Ampere+ GPUs and fp16 on older CUDA."""
+    if not amp or device.type != "cuda" or not torch.cuda.is_available():
         return None, "fp32"
     index = device.index if device.index is not None else torch.cuda.current_device()
     major, _minor = torch.cuda.get_device_capability(index)
@@ -86,9 +87,10 @@ def build_esm_batches(
 
 
 def _extract_layers(hidden_states, layer_indices: Sequence[int], sequence_length: int, batch_index: int) -> List[np.ndarray]:
+    # Keep the <cls> and <eos> states, as the original does: sequence_length + 2 rows.
     extracted = []
     for layer_index in layer_indices:
-        extracted.append(hidden_states[layer_index][batch_index, 1 : sequence_length + 1].detach().cpu().numpy())
+        extracted.append(hidden_states[layer_index][batch_index, : sequence_length + 2].detach().cpu().numpy())
     return extracted
 
 
@@ -118,46 +120,6 @@ def _esm_forward(
     return embedded
 
 
-def embed_long_sequence(
-    model,
-    tokenizer,
-    sequence: str,
-    layer_indices: Sequence[int],
-    device: torch.device,
-    autocast_dtype=None,
-    max_window: int = 1024,
-    stride: int = 896,
-) -> Dict[str, np.ndarray]:
-    normalized = normalize_sequence(sequence)
-    if len(normalized) <= max_window:
-        return _esm_forward(model, tokenizer, [normalized], layer_indices=layer_indices, device=device, autocast_dtype=autocast_dtype)[normalized]
-    if stride >= max_window:
-        raise ValueError("stride must be smaller than max_window for long-sequence extraction")
-
-    accumulators = None
-    counts = np.zeros((len(normalized), 1), dtype=np.float32)
-    start = 0
-    while start < len(normalized):
-        end = min(start + max_window, len(normalized))
-        window = normalized[start:end]
-        window_item = _esm_forward(model, tokenizer, [window], layer_indices=layer_indices, device=device, autocast_dtype=autocast_dtype)[window]
-        layer_keys = protein_layer_keys(window_item)
-        if accumulators is None:
-            accumulators = [np.zeros((len(normalized), window_item[key].shape[-1]), dtype=np.float32) for key in layer_keys]
-        for layer_offset, key in enumerate(layer_keys):
-            accumulators[layer_offset][start:end] += window_item[key].astype(np.float32, copy=False)
-        counts[start:end] += 1.0
-        if end >= len(normalized):
-            break
-        start += stride
-
-    averaged = {}
-    for layer_offset, layer_index in enumerate(layer_indices):
-        averaged[f"layer_{layer_index}"] = (accumulators[layer_offset] / counts).astype(np.float32, copy=False)
-    averaged["length"] = np.asarray([len(normalized)], dtype=np.int32)
-    return averaged
-
-
 def graph_cache_item(smiles: str) -> Dict[str, np.ndarray]:
     graph = loading.get_data(
         str(smiles).strip(),
@@ -184,7 +146,7 @@ def protein_cache_item(
     sequence: str,
     hidden_states: Sequence[np.ndarray],
     layer_indices: Sequence[int],
-    protein_dtype: str = "float16",
+    protein_dtype: str = "float32",
 ) -> Dict[str, np.ndarray]:
     normalized = normalize_sequence(sequence)
     target_dtype = np.float16 if protein_dtype == "float16" else np.float32

@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from emulator_bench.common import DEFAULT_BASE_DIR, DEFAULT_EMBEDDINGS_DIR, DEFAULT_HIDDEN_STATE_INDICES, DEFAULT_VALUE_TYPES
+from emulator_bench.common import DEFAULT_DATASETS_DIR, DEFAULT_EMBEDDINGS_DIR, DEFAULT_HIDDEN_STATE_INDICES, DEFAULT_VALUE_TYPES
 
 
 CACHE_SCRIPT = REPO_ROOT / "emulator_bench" / "cache_embeddings.py"
@@ -20,8 +20,8 @@ def build_worker_command(args, shard_index: int):
     cmd = [
         sys.executable,
         str(CACHE_SCRIPT),
-        "--base_dir",
-        args.base_dir,
+        "--datasets_dir",
+        args.datasets_dir,
         "--embeddings_dir",
         args.embeddings_dir,
         "--value_types",
@@ -63,13 +63,15 @@ def build_worker_command(args, shard_index: int):
         cmd.extend(["--thresholds", *args.thresholds])
     if args.overwrite:
         cmd.append("--overwrite")
+    if args.amp:
+        cmd.append("--amp")
     return cmd
 
 
 def main():
     parser = argparse.ArgumentParser(description="Launch multiple GPU workers to build the shared BIND cache by hash sharding proteins and ligands.")
     parser.add_argument("--gpus", nargs="+", required=True)
-    parser.add_argument("--base_dir", type=str, default=str(DEFAULT_BASE_DIR))
+    parser.add_argument("--datasets_dir", type=str, default=str(DEFAULT_DATASETS_DIR))
     parser.add_argument("--embeddings_dir", type=str, default=str(DEFAULT_EMBEDDINGS_DIR))
     parser.add_argument("--value_types", nargs="+", default=DEFAULT_VALUE_TYPES)
     parser.add_argument("--split_groups", nargs="+", default=None)
@@ -84,7 +86,8 @@ def main():
     parser.add_argument("--max_residues", type=int, default=8192)
     parser.add_argument("--max_batch", type=int, default=8)
     parser.add_argument("--sliding_window_stride", type=int, default=896)
-    parser.add_argument("--protein_dtype", choices=["float16", "float32"], default="float16")
+    parser.add_argument("--protein_dtype", choices=["float16", "float32"], default="float32")
+    parser.add_argument("--amp", action="store_true", help="Opt-in bf16 autocast (default: the original fp16 autocast for training, fp32 ESM-2 caching).")
     parser.add_argument("--writer_threads", type=int, default=max(4, min(16, os.cpu_count() or 4)))
     parser.add_argument("--max_pending_writes", type=int, default=128)
     parser.add_argument("--device", type=str, default="cuda:0")

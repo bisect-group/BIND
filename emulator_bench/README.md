@@ -1,149 +1,44 @@
 # emulator_bench
 
-This bench adds a split-driven retraining workflow to `BIND` without touching the original `train_graph.py` path.
+Multi-seed evaluation of `BIND` with its original published settings on the default EMULaToR splits. The original `train_graph.py` path is not changed.
 
-It is designed for EMULaToR-style train/val/test trees under:
+## Tasks and data
 
-- `/home/da24s023/github/EMULaToR/data/processed/baselines/BIND/<value_type>`
+| Task | Split parent |
+|---|---|
+| `ki` | `data/processed/datasets/kinetic_dataset/ki` |
+| `kd`, `ic50`, `ec50` | `data/processed/datasets/binding_affinity_dataset/<task>` |
 
-Supported value types:
+Each task folder holds `random_splits_grouped_sequence`, `random_splits_grouped_smiles`, `uniprot_time_splits`, `enzyme_sequence_splits/threshold_<t>` and `substrate_splits/threshold_<t>`. Each split has `train/val/test.parquet`. The wrapper finds the folders on disk. The wrapper never uses the unified datasets.
 
-- `ki`
-- `kd`
-- `ic50`
-- `ec50`
+Inputs per row: `sequence`, `smiles`, `log10_value` (target).
 
-## What The Model Uses
+## Model and settings
 
-Inputs per sample:
+- Protein: frozen `facebook/esm2_t33_650M_UR50D`. The cross-attention uses hidden states 0, 10, 20 and 30, as in the released `model_graph.py`. The wrapper caches these.
+- Ligand: the graph from `loading.py`, cached once.
+- One BIND model per task. Only the matching regression head is trained. The classifier head is not used.
+- AdamW, lr 1e-4, weight decay 1e-3, cosine schedule, Huber loss with delta 2.0, no gradient clipping, no early stopping.
+- Effective batch size 256 (64 x 4 accumulation). The original uses 1 x 256.
+- Budget: 10.37 epochs of the training split, as in the paper (100 000 iterations over 2.47 M rows). The test metrics come from the final model.
+- Leaky ReLU slope 0.01 and GATv2 slope 0.01, as in the released code. The paper text says 0.05.
+- Proteins are cut to the first 2048 residues. No row is dropped.
+- Training uses fp16 autocast with a grad scaler, as in the original `train_graph.py`. ESM-2 caching runs in fp32 and the cache is stored as float32 (the original runs ESM-2 in fp32 on CPU). `--amp` opts in to bf16 autocast and TF32 on Ampere or newer.
+- A val or test row missing from the cache stops the run with an error. Train rows missing from the cache are counted in `run_summary.json` (`filters`) and printed.
 
-- Protein sequence from the split file column `sequence`
-- Ligand SMILES from the split file column `smiles`
-- Target value from `log10_value` by default
+See `REPORT.md` for the sources and the paper-versus-code differences.
 
-Bench input encoding:
+## Files
 
-- Protein input uses cached hidden states from `facebook/esm2_t33_650M_UR50D`
-- The released code path cross-attends to hidden-state indices `0`, `10`, `20`, and `30`, so the bench caches those exact tensors by default
-- Ligand input uses the repo's original atom/bond featurisation path from `loading.py` and caches the resulting molecular graph once
+- `cache_embeddings.py`, `launch_parallel_cache_embeddings.py`: build the shared protein and ligand cache.
+- `train_regression_tvt.py`: train and evaluate one task on one split with one seed.
+- `run_split_benchmarks.py`: run all discovered splits and seeds (default seeds 666 777 888), optionally over many GPUs.
+- `aggregate_bind_results.py`: mean and variance over seeds.
 
-Default training mode:
+## Paths
 
-- One retrain per value type, using the original graph trunk and only the matching regression head as the supervised target
-- This is the fastest and safest setup for EMULaToR because the split trees are already separated by head and the data sizes are very different across `ki`, `kd`, `ic50`, and `ec50`
+- `--datasets_dir`: default `<EMULaToR>/data/processed/datasets`.
+- `--embeddings_dir`: default `<EMULaToR>/outputs/baselines/BIND/embeddings`.
+- `--output_dir`: default `<EMULaToR>/outputs/baselines/BIND/bind_results`. Each run writes to `<value_type>/<split_group>/<split_name>/seed_<N>`.
 
-## How Embeddings Are Cached
-
-Shared cache root:
-
-- `~/github/EMULaToR/data/processed/baselines/BIND/embeddings`
-
-Protein cache:
-
-- One file per normalized sequence
-- Stored under `embeddings/proteins/<model-and-layer-tag>/<hash-prefix>/<hash>.npz`
-- Cache payload stores only the four hidden states the released BIND code actually consumes, plus sequence length
-- Cache is shared across all four value types, so `ki`, `kd`, `ic50`, and `ec50` never recompute the same sequence
-
-Ligand cache:
-
-- One file per SMILES
-- Stored under `embeddings/ligands/graph_v1/<hash-prefix>/<hash>.npz`
-- Cache payload stores node features, edge index, and edge features from the repo's original graph builder
-- This means graph parsing and featurisation also happen only once
-
-Cache behavior:
-
-- Embeddings and graphs are only computed when the cache file does not already exist
-- Repeated training runs, Optuna trials, and multi-GPU retrains all reuse the same shared cache
-- The bench now truncates every protein to the first `2048` residues before caching or training
-- Long proteins are then passed directly into `facebook/esm2_t33_650M_UR50D` with no sliding-window rescue logic
-
-## Original Settings Found In The Repo
-
-Released training script:
-
-- `train_graph.py` sets `iterations = 100000`, `learning_rate = 1e-4`, `batch_size = 1`, `grad_accumulation_steps = 256`
-- `train_graph.py` uses `AdamW(..., weight_decay=1e-3)`, `HuberLoss(delta=2.0)`, cosine annealing, and AMP
-- `train_graph.py` loads `facebook/esm2_t33_650M_UR50D` and keeps it frozen by calling `.eval()`
-- The bench currently defaults to a plain `11`-epoch loop for retraining, while still exposing paper-style step-budget flags if you want them
-- The current bench throughput preset keeps that same effective batch size `256` but defaults to `batch_size = 64` and `grad_accumulation_steps = 4` to reduce tiny micro-batch overhead on large modern GPUs
-
-Released model definition:
-
-- `model_graph.py` defines five `GATv2Conv` blocks, four cross-attention blocks, `LCMAggregation`, four regression heads, plus one classifier head
-- `model_graph.py` cross-attends to `hidden_states[0]`, `hidden_states[10]`, `hidden_states[20]`, and `hidden_states[30]`
-- `cross_attention_graph.py` defaults the cross-attention dropout to `0.1`
-- This bench uses `leaky_relu_negative_slope = 0.05` to match the paper-reported activation setting during retraining
-
-Paper-vs-code note:
-
-- The paper text says proteins longer than `2048` aa were removed and layers `1`, `11`, `21`, `31` were used
-- The released HuggingFace ESM-2 config exposes `max_position_embeddings = 1026`, which gives a practical `1024`-residue limit for the unmodified released code
-- This bench is intentionally configured for your retraining workflow to keep all rows by truncating sequences to the first `2048` residues, then passing them directly into ESM-2
-- Because the model itself still has a native context limit of about `1024` residues, very long truncated sequences may fail unless the upstream stack tolerates them
-
-## What This Bench Changes
-
-Compared with the original repo training flow, this bench adds:
-
-- Explicit train/val/test split loading from EMULaToR parquet or CSV files
-- One shared model-level cache for protein hidden states and ligand graphs across all four value types
-- Automatic mixed precision:
-  `bf16` on Ampere-or-newer CUDA devices, otherwise `fp16`
-- TF32 enabled for CUDA matmul and cuDNN where available
-- Flash / memory-efficient scaled-dot-product attention enabled where PyTorch supports it
-- Full-split deterministic TVT training instead of repeated random sampling from one monolithic JSON
-- Optuna restricted to retraining-safe optimisation hyperparameters while keeping the released architecture fixed
-- Multi-GPU parallel retraining from the best per-value Optuna result
-- Removal of the decoy classifier and temperature parameter from the retrain path, while preserving the released regression trunk
-
-## Bench Scripts
-
-Core scripts:
-
-- `cache_embeddings.py`: scans the split tree and builds reusable protein and ligand caches once
-- `launch_parallel_cache_embeddings.py`: shards proteins and ligands by hash and fills the shared cache across multiple GPUs safely
-- `train_regression_tvt.py`: trains one value-type regression model on one explicit train/val/test split
-- `run_split_benchmarks.py`: benchmark runner across discovered split jobs, with optional multi-GPU parallel execution across seeds and split jobs
-
-Tuning and parallel execution:
-
-- `tune_optuna.py`: tunes only optimisation hyperparameters for one value type
-- `launch_parallel_optuna.py`: launches multiple single-GPU Optuna workers against one shared study for one value type
-- `launch_parallel_retrain_from_optuna.py`: loads the best Optuna hparams per value type and retrains many split jobs in parallel across multiple GPUs
-
-Parallel retrain note:
-
-- `launch_parallel_retrain_from_optuna.py` accepts multiple value types in one run
-- The launcher loads `bind_<value_type>_optuna_best_hparams.json` for each requested value type unless you override the template
-- Example: one command can drain `ki`, `kd`, `ic50`, and `ec50` split jobs across all visible GPU slots
-
-## Recommended Strategy
-
-For your use case, separate checkpoints per value type are the default and recommended choice:
-
-- The EMULaToR directory tree is already split per value type
-- Each head has a very different dataset size, so separate Optuna studies let the training schedule adapt cleanly
-- This avoids introducing extra multi-task weighting choices that would make comparison to the released regression heads harder
-
-The trunk architecture is still shared in code:
-
-- Every per-head retrain uses the same released BIND graph trunk
-- Only the supervised regression head changes by value type
-
-## Outputs
-
-Each training run writes:
-
-- `bestmodel.pt`
-- `bestmodel_state_dict.pth`
-- `checkpoint_last.pt`
-- `final_results_train.csv`
-- `final_results_val.csv`
-- `final_results_test.csv`
-- `pred_label_train.csv`
-- `pred_label_val.csv`
-- `pred_label_test.csv`
-- `logfile.csv`
-- `run_summary.json`
+Each run writes `bestmodel.pt`, `bestmodel_state_dict.pth`, `checkpoint_last.pt`, `final_results_{train,val,test}.csv`, `pred_label_{train,val,test}.csv`, `logfile.csv` and `run_summary.json`. A finished seed is skipped unless `--overwrite` is set. `--overwrite` also retrains from scratch and ignores `checkpoint_last.pt`. See `../commands.txt` for the commands.
