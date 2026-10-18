@@ -15,8 +15,7 @@ $PY emulator_bench/run_split_benchmarks.py \
   --skip_cache \
   --value_types ki kd ic50 ec50 \
   --gpus 0 1 2 3 \
-  --runs_per_gpu 2 \
-  --pin_memory --persistent_workers
+  --runs_per_gpu 2
 
 # One task, one split, one seed (direct call). Thresholds differ by task: list them first.
 #   ls ../../data/processed/datasets/binding_affinity_dataset/kd/enzyme_sequence_splits
@@ -28,6 +27,9 @@ $PY emulator_bench/train_regression_tvt.py \
   --seed 666 \
   --device cuda:0
 
+# Chunking: each batch of 64 rows runs as length-sorted chunks of 16 rows (--micro_batch_size 16, default). Same optimizer step, within fp noise.
+# Add --micro_batch_size 64 to run unchunked (the exact earlier behaviour; needs more than 22 GB for long proteins).
+# The protein cache is now proteins_v4 (.npy). Rebuild it with step 1 after updating.
 # Optional: add --amp to any training or caching command for bf16 autocast (default: original fp16 training, fp32 caching).
 # Add --overwrite to run_split_benchmarks.py to retrain from scratch (no resume from checkpoint_last.pt).
 

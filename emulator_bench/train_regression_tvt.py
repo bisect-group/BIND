@@ -2,9 +2,9 @@ import argparse
 import datetime
 import gc
 import math
-import os
 import time
 from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -131,24 +131,31 @@ def evaluate_loader(model, loader, device, criterion, target_head, autocast_dtyp
     preds = []
     truths = []
     metadatas = []
-    total_loss = 0.0
+    indices = []
+    total_loss = torch.zeros((), dtype=torch.float64, device=device)
     total_samples = 0
     iterator = progress(loader, desc=desc, unit="batch", leave=False) if show_progress else loader
     with torch.no_grad():
-        for batch in iterator:
-            batch = _prepare_batch(batch, device)
-            with _autocast_context(device, autocast_dtype):
-                outputs = model(batch.graphs, batch.protein_layers, batch.attention_mask)
-                prediction = outputs[target_head]
-                loss = criterion(prediction, batch.targets)
-            total_loss += float(loss.item()) * int(batch.targets.shape[0])
-            total_samples += int(batch.targets.shape[0])
-            preds.append(prediction.detach().cpu().float())
-            truths.append(batch.targets.detach().cpu().float())
-            metadatas.extend(batch.metadata)
-    pred_np = torch.cat(preds).numpy() if preds else np.array([], dtype=np.float32)
-    truth_np = torch.cat(truths).numpy() if truths else np.array([], dtype=np.float32)
-    avg_loss = total_loss / max(1, total_samples)
+        for chunks in iterator:
+            for chunk in chunks:
+                chunk = _prepare_batch(chunk, device)
+                with _autocast_context(device, autocast_dtype):
+                    outputs = model(chunk.graphs, chunk.protein_layers, chunk.attention_mask)
+                    prediction = outputs[target_head]
+                    loss = criterion(prediction, chunk.targets)
+                rows = int(chunk.targets.shape[0])
+                total_loss += loss.double() * rows
+                total_samples += rows
+                preds.append(prediction.detach().float())
+                truths.append(chunk.targets.detach().float())
+                metadatas.extend(chunk.metadata)
+                indices.extend(chunk.indices)
+    pred_np = torch.cat(preds).cpu().numpy() if preds else np.array([], dtype=np.float32)
+    truth_np = torch.cat(truths).cpu().numpy() if truths else np.array([], dtype=np.float32)
+    order = np.argsort(indices, kind="stable")
+    pred_np, truth_np = pred_np[order], truth_np[order]
+    metadatas = [metadatas[i] for i in order]
+    avg_loss = float(total_loss) / max(1, total_samples)
     metrics = regression_metrics(truth_np, pred_np)
     metrics["loss"] = avg_loss
     metrics[metric_name] = avg_loss if metric_name == "loss" else _monitor_metric_from_arrays(metric_name, truth_np, pred_np)
@@ -170,71 +177,87 @@ def train_one_epoch(
     autocast_dtype=None,
     clip_grad=None,
     desc="Train",
-    max_consecutive_bad_batches: int = 50,
+    max_consecutive_bad_steps: int = 50,
+    log_every_steps: int = 10,
 ):
+    """One epoch. Each loader item is a list of micro-batches that together form one drawn batch.
+
+    Every micro-batch loss is weighted by its share of the batch, so the gradient equals the
+    full-batch mean-loss gradient. The only host sync is one non-finite check per optimizer step.
+    """
     model.train()
-    total_loss = 0.0
+    epoch_loss = torch.zeros((), dtype=torch.float64, device=device)
     total_samples = 0
+    window_terms = []
+    window_samples = 0
     optimizer.zero_grad(set_to_none=True)
     iterator = progress(loader, desc=desc, unit="batch", leave=False)
     optimizer_steps_this_epoch = 0
     total_epochs = getattr(loader, "_bench_total_epochs", None)
     epoch_index = getattr(loader, "_bench_epoch_index", None)
-    consecutive_bad_batches = 0
-    for step_index, batch in enumerate(iterator, start=1):
-        batch = _prepare_batch(batch, device)
-        with _autocast_context(device, autocast_dtype):
-            outputs = model(batch.graphs, batch.protein_layers, batch.attention_mask)
-            prediction = outputs[target_head]
-            loss = criterion(prediction, batch.targets)
-
-        if not loss.isfinite():
-            consecutive_bad_batches += 1
-            if consecutive_bad_batches >= max_consecutive_bad_batches:
-                raise RuntimeError(
-                    f"Training aborted: {consecutive_bad_batches} consecutive non-finite loss batches. "
-                    "Training diverged."
-                )
-            iterator.set_postfix({"loss": "non-finite", "skipped": consecutive_bad_batches})
-            continue
-        consecutive_bad_batches = 0
-
-        if scaler.is_enabled():
-            scaler.scale(loss / grad_accumulation_steps).backward()
-        else:
-            (loss / grad_accumulation_steps).backward()
+    consecutive_bad_steps = 0
+    for step_index, chunks in enumerate(iterator, start=1):
+        batch_rows = sum(int(chunk.targets.shape[0]) for chunk in chunks)
+        for chunk in chunks:
+            chunk = _prepare_batch(chunk, device)
+            with _autocast_context(device, autocast_dtype):
+                outputs = model(chunk.graphs, chunk.protein_layers, chunk.attention_mask)
+                prediction = outputs[target_head]
+                loss = criterion(prediction, chunk.targets)
+            rows = int(chunk.targets.shape[0])
+            scaled_loss = loss * (rows / batch_rows) / grad_accumulation_steps
+            if scaler.is_enabled():
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+            window_terms.append(loss.detach().double() * rows)
+            window_samples += rows
 
         should_step = (step_index % grad_accumulation_steps == 0) or (step_index == len(loader))
-        if should_step:
-            if scaler.is_enabled():
-                if clip_grad is not None and clip_grad > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                if clip_grad is not None and clip_grad > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-                optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
+        if not should_step:
+            continue
+        terms = torch.stack(window_terms)
+        window_terms = []
+        if not terms.isfinite().all().item():
+            consecutive_bad_steps += 1
+            if consecutive_bad_steps >= max_consecutive_bad_steps:
+                raise RuntimeError(
+                    f"Training aborted: {consecutive_bad_steps} consecutive optimizer steps with a non-finite loss. "
+                    "Training diverged."
+                )
+            iterator.set_postfix({"loss": "non-finite", "skipped": consecutive_bad_steps})
             optimizer.zero_grad(set_to_none=True)
-            optimizer_steps_completed += 1
-            optimizer_steps_this_epoch += 1
+            window_samples = 0
+            continue
+        consecutive_bad_steps = 0
+        for term in terms:
+            epoch_loss += term
+        total_samples += window_samples
 
-        total_loss += float(loss.item()) * int(batch.targets.shape[0])
-        total_samples += int(batch.targets.shape[0])
-        postfix = {"loss": f"{float(loss.item()):.4f}"}
-        if epoch_index is not None and total_epochs is not None:
-            postfix["epoch"] = f"{epoch_index}/{total_epochs}"
+        if scaler.is_enabled():
+            if clip_grad is not None and clip_grad > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            postfix["epoch"] = "?"
-        iterator.set_postfix(postfix)
+            if clip_grad is not None and clip_grad > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        optimizer_steps_completed += 1
+        optimizer_steps_this_epoch += 1
+        if optimizer_steps_this_epoch % log_every_steps == 0:
+            epoch_text = f"{epoch_index}/{total_epochs}" if epoch_index is not None and total_epochs is not None else "?"
+            iterator.set_postfix({"loss": f"{float(terms.sum()) / window_samples:.4f}", "epoch": epoch_text})
+        window_samples = 0
         if optimizer_steps_completed >= max_optimizer_steps:
             break
 
     return {
-        "loss": total_loss / max(1, total_samples),
+        "loss": float(epoch_loss) / max(1, total_samples),
         "optimizer_steps_completed": int(optimizer_steps_completed),
         "optimizer_steps_this_epoch": int(optimizer_steps_this_epoch),
     }
@@ -355,6 +378,7 @@ def main():
     parser.add_argument("--leaky_relu_negative_slope", type=float, default=0.01)
 
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--micro_batch_size", type=int, default=16, help="Rows per forward/backward chunk. One optimizer step still covers batch_size rows. Set to batch_size to disable chunking.")
     parser.add_argument("--grad_accumulation_steps", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=11)
     parser.add_argument("--train_budget_mode", choices=["paper_steps", "fixed_epochs", "fixed_optimizer_steps"], default="paper_steps")
@@ -378,13 +402,9 @@ def main():
     parser.add_argument("--validate_every_epochs", type=int, default=0)
 
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--num_workers", type=int, default=min(16, os.cpu_count() or 1))
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=2)
-    parser.add_argument("--persistent_workers", action="store_true")
-    parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--sharing_strategy", choices=["file_descriptor", "file_system"], default="file_system")
-    parser.add_argument("--preload_proteins", action="store_true")
-    parser.add_argument("--protein_cache_items", type=int, default=512)
     parser.add_argument("--lazy_ligands", action="store_true")
     parser.add_argument("--preload_ligands", action="store_true")
     parser.add_argument("--torch_compile", action="store_true")
@@ -446,10 +466,6 @@ def main():
     if train_df.empty or val_df.empty or test_df.empty:
         raise RuntimeError("One or more filtered splits are empty after applying cache and sequence-length checks.")
 
-    all_sequences = pd.concat(
-        [train_df[args.sequence_col], val_df[args.sequence_col], test_df[args.sequence_col]],
-        ignore_index=True,
-    ).astype(str)
     all_smiles = pd.concat(
         [train_df[args.smiles_col], val_df[args.smiles_col], test_df[args.smiles_col]],
         ignore_index=True,
@@ -460,9 +476,6 @@ def main():
         model_name=args.protein_model_name,
         layer_indices=args.hidden_state_indices,
         protein_length_cap=args.protein_length_cap,
-        sequences=all_sequences.tolist(),
-        preload=args.preload_proteins,
-        max_items=args.protein_cache_items,
     )
     ligand_store = LigandGraphStore(
         embeddings_dir,
@@ -474,19 +487,15 @@ def main():
     val_dataset = CachedBindDataset(val_df, protein_store, ligand_store, args.sequence_col, args.smiles_col, args.target_col)
     test_dataset = CachedBindDataset(test_df, protein_store, ligand_store, args.sequence_col, args.smiles_col, args.target_col)
 
-    pin_memory = args.pin_memory or device.type == "cuda"
-    loader_kwargs = {
+    eval_loader_kwargs = {
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
-        "pin_memory": pin_memory,
-        "collate_fn": collate_bind_samples,
+        "pin_memory": device.type == "cuda",
+        "collate_fn": partial(collate_bind_samples, micro_batch_size=args.micro_batch_size),
     }
     if args.num_workers > 0:
-        loader_kwargs["persistent_workers"] = args.persistent_workers
-        loader_kwargs["prefetch_factor"] = args.prefetch_factor
-
-    eval_loader_kwargs = dict(loader_kwargs)
-    eval_loader_kwargs["persistent_workers"] = False
+        eval_loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    loader_kwargs = dict(eval_loader_kwargs, persistent_workers=args.num_workers > 0)
 
     train_loader = _make_loader(train_dataset, loader_kwargs, sampler=ReplacementSampler(len(train_dataset)))
 

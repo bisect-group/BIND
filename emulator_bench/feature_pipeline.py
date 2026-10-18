@@ -142,22 +142,9 @@ def graph_cache_item(smiles: str) -> Dict[str, np.ndarray]:
     }
 
 
-def protein_cache_item(
-    sequence: str,
-    hidden_states: Sequence[np.ndarray],
-    layer_indices: Sequence[int],
-    protein_dtype: str = "float32",
-) -> Dict[str, np.ndarray]:
-    normalized = normalize_sequence(sequence)
-    target_dtype = np.float16 if protein_dtype == "float16" else np.float32
-    item = {"length": np.asarray([len(normalized)], dtype=np.int32)}
-    for hidden_state, layer_index in zip(hidden_states, layer_indices):
-        item[f"layer_{int(layer_index)}"] = np.asarray(hidden_state, dtype=target_dtype)
-    return item
-
-
-def protein_layer_keys(item: Dict[str, np.ndarray]) -> List[str]:
-    return sorted([key for key in item.keys() if key.startswith("layer_")], key=lambda value: int(value.split("_")[1]))
+def protein_cache_item(hidden_states: Sequence[np.ndarray], protein_dtype: str = "float32") -> np.ndarray:
+    """One array per protein, shape (layers, residues + 2, features), so it can be memory-mapped."""
+    return np.stack(hidden_states).astype(np.float16 if protein_dtype == "float16" else np.float32, copy=False)
 
 
 def load_npz(path: Path) -> Dict[str, np.ndarray]:
@@ -171,44 +158,22 @@ def load_npz(path: Path) -> Dict[str, np.ndarray]:
 
 
 class ProteinEmbeddingStore:
-    def __init__(
-        self,
-        embeddings_dir: Path,
-        model_name: str,
-        layer_indices: Sequence[int],
-        protein_length_cap: int,
-        sequences: Optional[Sequence[str]] = None,
-        preload: bool = False,
-        max_items: int = 1024,
-    ):
+    """Memory-maps one .npy per protein. Workers share the OS page cache, so nothing is held per worker."""
+
+    def __init__(self, embeddings_dir: Path, model_name: str, layer_indices: Sequence[int], protein_length_cap: int):
         self.embeddings_dir = Path(embeddings_dir)
         self.model_name = model_name
         self.layer_indices = list(layer_indices)
         self.protein_length_cap = int(protein_length_cap)
-        self.max_items = max(1, int(max_items))
-        self._cache: "OrderedDict[str, Dict[str, np.ndarray]]" = OrderedDict()
-        if preload and sequences is not None:
-            unique_sequences = sorted({normalize_sequence(sequence) for sequence in sequences})
-            for sequence in unique_sequences:
-                path = protein_cache_path(self.embeddings_dir, sequence, self.model_name, self.layer_indices, self.protein_length_cap)
-                if not path.exists():
-                    raise FileNotFoundError(f"Missing cached protein embedding: {path}")
-                self._cache[sequence] = load_npz(path)
 
-    def get(self, sequence: str) -> Dict[str, np.ndarray]:
-        normalized = normalize_sequence(sequence)
-        if normalized in self._cache:
-            self._cache.move_to_end(normalized)
-            return self._cache[normalized]
-
-        path = protein_cache_path(self.embeddings_dir, normalized, self.model_name, self.layer_indices, self.protein_length_cap)
-        if not path.exists():
-            raise FileNotFoundError(f"Missing cached protein embedding: {path}")
-        item = load_npz(path)
-        self._cache[normalized] = item
-        if len(self._cache) > self.max_items:
-            self._cache.popitem(last=False)
-        return item
+    def get(self, sequence: str) -> np.ndarray:
+        path = protein_cache_path(self.embeddings_dir, sequence, self.model_name, self.layer_indices, self.protein_length_cap)
+        try:
+            return np.load(path, mmap_mode="r")
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Missing cached protein embedding: {path}") from None
+        except (EOFError, OSError, ValueError) as exc:
+            raise RuntimeError(f"Corrupted cache file: {path}. Rebuild with `cache_embeddings.py --overwrite`.") from exc
 
 
 class LigandGraphStore:

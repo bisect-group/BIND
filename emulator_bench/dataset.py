@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, Sampler
 from torch_geometric.data import Batch, Data
 
 from emulator_bench.common import normalize_sequence
-from emulator_bench.feature_pipeline import LigandGraphStore, ProteinEmbeddingStore, protein_layer_keys
+from emulator_bench.feature_pipeline import LigandGraphStore, ProteinEmbeddingStore
 
 
 @dataclass
@@ -19,9 +19,17 @@ class BindBatch:
     attention_mask: torch.Tensor
     targets: torch.Tensor
     metadata: List[Dict]
+    indices: List[int]
+
+    def pin_memory(self):
+        self.graphs = self.graphs.pin_memory()
+        self.protein_layers = [layer.pin_memory() for layer in self.protein_layers]
+        self.attention_mask = self.attention_mask.pin_memory()
+        self.targets = self.targets.pin_memory()
+        return self
 
     def to(self, device: torch.device):
-        self.graphs = self.graphs.to(device)
+        self.graphs = self.graphs.to(device, non_blocking=True)
         self.attention_mask = self.attention_mask.to(device, non_blocking=True)
         self.targets = self.targets.to(device, non_blocking=True)
         self.protein_layers = [layer.to(device, non_blocking=True) for layer in self.protein_layers]
@@ -75,6 +83,7 @@ class CachedBindDataset(Dataset):
         metadata["smiles"] = smiles
 
         return {
+            "index": idx,
             "graph": ligand,
             "protein": protein,
             "target": float(row[self.target_col]),
@@ -100,46 +109,44 @@ def _normalize_metadata_value(value):
     return value
 
 
-def collate_bind_samples(samples: List[Dict]) -> BindBatch:
+def collate_bind_samples(samples: List[Dict], micro_batch_size: int) -> List[BindBatch]:
+    """Split one drawn batch into micro-batches, each padded to its own longest protein.
+
+    A micro-batch size of at least the batch size keeps one chunk in the original row order.
+    Otherwise rows are sorted by protein length first, so chunk contents stay similar in length.
+    """
     if not samples:
         raise ValueError("Cannot collate an empty batch")
+    if micro_batch_size < len(samples):
+        samples = sorted(samples, key=lambda sample: -sample["protein"].shape[1])
+    return [_collate_chunk(samples[start : start + micro_batch_size]) for start in range(0, len(samples), micro_batch_size)]
 
-    graphs = []
-    metadata = []
-    targets = []
-    protein_items = [sample["protein"] for sample in samples]
-    layer_keys = protein_layer_keys(protein_items[0])
-    lengths = [item[layer_keys[0]].shape[0] for item in protein_items]
+
+def _collate_chunk(samples: List[Dict]) -> BindBatch:
+    proteins = [sample["protein"] for sample in samples]
+    lengths = [protein.shape[1] for protein in proteins]
     max_len = max(lengths)
     batch_size = len(samples)
-    protein_layers = []
-
-    for layer_key in layer_keys:
-        feature_dim = int(protein_items[0][layer_key].shape[-1])
-        padded = torch.zeros((batch_size, max_len, feature_dim), dtype=torch.from_numpy(protein_items[0][layer_key]).dtype)
-        for batch_index, item in enumerate(protein_items):
-            current = torch.from_numpy(item[layer_key])
-            padded[batch_index, : current.shape[0]] = current
-        protein_layers.append(padded)
-
+    padded = np.zeros((proteins[0].shape[0], batch_size, max_len, proteins[0].shape[2]), dtype=proteins[0].dtype)
     attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
-
-    for batch_index, sample in enumerate(samples):
+    graphs = []
+    for batch_index, (sample, length) in enumerate(zip(samples, lengths)):
+        padded[:, batch_index, :length] = sample["protein"]
         graph_item = sample["graph"]
-        graph = Data(
-            x=torch.from_numpy(graph_item["x"]),
-            edge_index=torch.from_numpy(graph_item["edge_index"]),
-            edge_features=torch.from_numpy(graph_item["edge_features"]),
+        graphs.append(
+            Data(
+                x=torch.from_numpy(graph_item["x"]),
+                edge_index=torch.from_numpy(graph_item["edge_index"]),
+                edge_features=torch.from_numpy(graph_item["edge_features"]),
+            )
         )
-        graphs.append(graph)
-        attention_mask[batch_index, : lengths[batch_index]] = True
-        targets.append(float(sample["target"]))
-        metadata.append(sample["metadata"])
+        attention_mask[batch_index, :length] = True
 
     return BindBatch(
         graphs=Batch.from_data_list(graphs),
-        protein_layers=protein_layers,
+        protein_layers=list(torch.from_numpy(padded).unbind(0)),
         attention_mask=attention_mask,
-        targets=torch.tensor(targets, dtype=torch.float32).unsqueeze(1),
-        metadata=metadata,
+        targets=torch.tensor([float(sample["target"]) for sample in samples], dtype=torch.float32).unsqueeze(1),
+        metadata=[sample["metadata"] for sample in samples],
+        indices=[sample["index"] for sample in samples],
     )

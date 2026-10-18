@@ -84,13 +84,11 @@ def train_one(job, seed, args, gpu_id=None):
         "cuda:0" if gpu_id is not None else args.device,
         "--num_workers",
         str(args.num_workers),
+        "--micro_batch_size",
+        str(args.micro_batch_size),
         "--seed",
         str(seed),
     ]
-    if args.pin_memory:
-        cmd.append("--pin_memory")
-    if args.persistent_workers:
-        cmd.append("--persistent_workers")
     if args.overwrite:
         cmd.append("--no_resume")
     if args.amp:
@@ -183,9 +181,8 @@ def main():
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--max_residues", type=int, default=8192)
     parser.add_argument("--max_batch", type=int, default=8)
-    parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--persistent_workers", action="store_true")
-    parser.add_argument("--pin_memory", action="store_true")
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--micro_batch_size", type=int, default=16, help="Forwarded to train_regression_tvt.py. Set to 64 (the batch size) to disable chunking.")
     parser.add_argument("--amp", action="store_true", help="Opt-in bf16 autocast and TF32 on Ampere+ (default: the original fp16 autocast for training, fp32 ESM-2 caching).")
     args = parser.parse_args()
 

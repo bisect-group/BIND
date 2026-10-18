@@ -20,6 +20,7 @@ Inputs per row: `sequence`, `smiles`, `log10_value` (target).
 - One BIND model per task. Only the matching regression head is trained. The classifier head is not used.
 - AdamW, lr 1e-4, weight decay 1e-3, cosine schedule, Huber loss with delta 2.0, no gradient clipping, no early stopping.
 - Effective batch size 256 (64 x 4 accumulation). The original uses 1 x 256.
+- Each drawn batch of 64 rows runs as length-sorted chunks of `--micro_batch_size` rows (default 16), each padded to its own longest protein. Gradients accumulate so one optimizer step covers the same rows with the same loss scale. Results match the unchunked run only within floating-point noise. `--micro_batch_size 64` (the batch size) turns chunking off and gives the exact earlier behaviour. Without chunking, a batch of 64 with a 2048-residue protein does not fit on a 22 GB GPU.
 - Budget: 10.37 epochs of the training split, as in the paper (100 000 iterations over 2.47 M rows). The test metrics come from the final model.
 - Leaky ReLU slope 0.01 and GATv2 slope 0.01, as in the released code. The paper text says 0.05.
 - Proteins are cut to the first 2048 residues. No row is dropped.
@@ -32,7 +33,7 @@ See `REPORT.md` for the sources and the paper-versus-code differences.
 
 - `cache_embeddings.py`, `launch_parallel_cache_embeddings.py`: build the shared protein and ligand cache.
 - `train_regression_tvt.py`: train and evaluate one task on one split with one seed.
-- `run_split_benchmarks.py`: run all discovered splits and seeds (default seeds 666 777 888), optionally over many GPUs (`--gpus 0 1 --runs_per_gpu 2`). `--amp` switches the fp16 default to bf16.
+- `run_split_benchmarks.py`: run all discovered splits and seeds (default seeds 666 777 888), optionally over many GPUs (`--gpus 0 1 --runs_per_gpu 2`). `--micro_batch_size` is passed to the trainer. `--amp` switches the fp16 default to bf16.
 - `aggregate_bind_results.py`: mean and variance over seeds.
 
 ## Paths
@@ -40,6 +41,6 @@ See `REPORT.md` for the sources and the paper-versus-code differences.
 - `--datasets_dir`: default `<EMULaToR>/data/processed/datasets`.
 - `--embeddings_dir`: default `<EMULaToR>/outputs/baselines/BIND/embeddings`.
 - `--output_dir`: default `<EMULaToR>/outputs/baselines/BIND`. Each run writes to `<value_type>/<split_group>/<split_name>/seed_<N>`. `<split_name>` is `all` for flat split groups. Summaries go to `<output_dir>/summaries` and `<output_dir>/aggregate_bind_results.csv`.
-- The cache has `proteins_v3/<model>_layers_<ids>_cap_<protein_length_cap>_cls_eos/` and `ligands_v3/`. Change `CACHE_VERSION` in `common.py` to force a rebuild.
+- The cache has `proteins_v4/<model>_layers_<ids>_cap_<protein_length_cap>_cls_eos/` and `ligands_v3/`. Each protein is one uncompressed float32 `.npy` of shape (4 layers, residues + 2, 1280), read with `np.load(mmap_mode="r")`. All workers share the OS page cache. Change `PROTEIN_CACHE_VERSION` or `CACHE_VERSION` in `common.py` to force a rebuild. A `proteins_v3` cache is not read; rebuild with `cache_embeddings.py`.
 
 Each run writes `bestmodel.pth`, `bestmodel_state_dict.pth`, `checkpoint_last.pt`, `final_results_{train,val,test}.csv`, `pred_label_{train,val,test}.csv`, `logfile.csv` and `run_summary.json`. A finished seed is skipped unless `--overwrite` is set. `--overwrite` also retrains from scratch and ignores `checkpoint_last.pt`. See `../commands.txt` for the commands. Run them from `baselines/BIND`.

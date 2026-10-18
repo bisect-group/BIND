@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from emulator_bench.common import (
     CACHE_VERSION,
+    PROTEIN_CACHE_VERSION,
     DEFAULT_DATASETS_DIR,
     DEFAULT_EMBEDDINGS_DIR,
     DEFAULT_HIDDEN_STATE_INDICES,
@@ -67,6 +68,14 @@ def _save_npz(path: Path, item: dict) -> None:
     tmp_path.replace(path)
 
 
+def _save_npy(path: Path, array: np.ndarray) -> None:
+    ensure_parent(path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "wb") as handle:
+        np.save(handle, array)
+    tmp_path.replace(path)
+
+
 class AsyncNpzWriter:
     def __init__(self, max_workers: int = 8, max_pending: int = 64):
         self.max_workers = max(1, int(max_workers))
@@ -74,8 +83,8 @@ class AsyncNpzWriter:
         self._executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="bind_cache_write")
         self._pending = set()
 
-    def submit(self, path: Path, item: dict) -> None:
-        future = self._executor.submit(_save_npz, path, item)
+    def submit(self, path: Path, item) -> None:
+        future = self._executor.submit(_save_npy if isinstance(item, np.ndarray) else _save_npz, path, item)
         self._pending.add(future)
         self._drain_if_needed()
 
@@ -210,9 +219,7 @@ def cache_proteins(args, sequences):
                         protein_length_cap=args.protein_length_cap,
                     ),
                     protein_cache_item(
-                        sequence,
                         [embedded[sequence][f"layer_{index}"] for index in args.hidden_state_indices],
-                        layer_indices=args.hidden_state_indices,
                         protein_dtype=args.protein_dtype,
                     ),
                 )
@@ -337,6 +344,7 @@ def main():
 
     manifest = {
         "cache_version": CACHE_VERSION,
+        "protein_cache_version": PROTEIN_CACHE_VERSION,
         "datasets_dir": str(args.datasets_dir),
         "embeddings_dir": str(args.embeddings_dir),
         "value_types": list(args.value_types),

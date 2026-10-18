@@ -57,7 +57,10 @@ It caches ESM-2 states and ligand graphs once, then trains and reports train/val
 - Effective batch 256 as 64 x 4 instead of 1 x 256. Same effective batch. The model has no batch statistics, but the batch layout was not verified beyond reading the code.
 - ESM-2 states are cached on disk as float32 (default) and ESM-2 caching runs in fp32. The original runs ESM-2 live in fp32 on CPU.
 - Training precision: the original `train_graph.py` uses fp16 autocast with GradScaler (lines 67, 105, 180). The default stays the same: fp16 autocast with GradScaler. `--amp` is an opt-in to bf16 autocast and TF32. The appendix bf16 claim does not override the code.
-- Cached ligand graphs and DataLoader workers.
+- Cached ligand graphs and DataLoader workers (4 persistent workers, pinned memory, prefetch factor 2).
+- Protein cache `proteins_v4`: one uncompressed float32 `.npy` per protein, memory-mapped. Values equal the old `.npz` arrays.
+- No per-step host syncs. The loss is summed on the GPU. The non-finite check runs once per optimizer step and skips the whole step (all accumulated rows) when it fails.
+- Chunking (`--micro_batch_size`, default 16): each drawn batch of 64 rows runs as length-sorted chunks, each padded to its own longest protein. The loss of each chunk is weighted by rows/batch rows, so one optimizer step covers the same rows with the same loss scale. This is a deviation within floating-point noise: in fp32 the gradient differs by 3e-7 (relative), in fp16 by about 0.5%. The padding is masked, so chunk length does not change the maths. Evaluation is chunked the same way and keeps the split row order. `--micro_batch_size 64` turns chunking off and gives the exact earlier behaviour (needs more than 22 GB of GPU memory for 2048-residue proteins).
 
 ## Matches the original
 - The ESM-2 cache keeps the `<cls>` and `<eos>` states. Each protein has residues + 2 rows. The attention mask covers them, as in `train_graph.py` and `model_graph.py`. The cache folder name ends in `_cls_eos` and the manifest has `cache_version` 2. Old caches are not read.
@@ -85,7 +88,7 @@ See `commands.txt`. Short form, from `baselines/BIND`:
 ```
 PY=/home/adhil/.conda/envs/mldb/bin/python
 $PY emulator_bench/launch_parallel_cache_embeddings.py --gpus 0 1 2 3 --value_types ki kd ic50 ec50
-$PY emulator_bench/run_split_benchmarks.py --skip_cache --value_types ki kd ic50 ec50 --gpus 0 1 2 3 --pin_memory --persistent_workers
+$PY emulator_bench/run_split_benchmarks.py --skip_cache --value_types ki kd ic50 ec50 --gpus 0 1 2 3
 $PY emulator_bench/aggregate_bind_results.py
 ```
 Seeds default to 666 777 888.
