@@ -1,25 +1,27 @@
 # Run from the BIND submodule root (baselines/BIND). Default paths are repo-relative:
 #   splits:     <EMULaToR>/data/processed/datasets/{kinetic_dataset/ki,binding_affinity_dataset/{kd,ic50,ec50}}
-#   embeddings: <EMULaToR>/data/processed/baselines/BIND/embeddings
-#   results:    <EMULaToR>/data/processed/baselines/BIND/bind_results/<value_type>/<split_group>/<split_name>/seed_<N>
+#   embeddings: <EMULaToR>/outputs/baselines/BIND/embeddings
+#   runs:       <EMULaToR>/outputs/baselines/BIND/<value_type>/<split_group>/<split_name>/seed_<N>  (<split_name> is "all" for flat split groups)
 # Override with --datasets_dir, --embeddings_dir and --output_dir.
+PY=/home/adhil/.conda/envs/mldb/bin/python
 
 # 1. Build the shared protein and ligand cache once (all four tasks, all default splits).
-/home/adhil/.conda/envs/mldb/bin/python emulator_bench/launch_parallel_cache_embeddings.py \
+$PY emulator_bench/launch_parallel_cache_embeddings.py \
   --gpus 0 1 2 3 \
   --value_types ki kd ic50 ec50
 
 # 2. Train and evaluate all tasks x splits x seeds (666 777 888) with the original settings.
-/home/adhil/.conda/envs/mldb/bin/python emulator_bench/run_split_benchmarks.py \
+$PY emulator_bench/run_split_benchmarks.py \
   --skip_cache \
   --value_types ki kd ic50 ec50 \
   --gpus 0 1 2 3 \
+  --runs_per_gpu 2 \
   --pin_memory --persistent_workers
 
 # One task, one split, one seed (direct call). Thresholds differ by task: list them first.
 #   ls ../../data/processed/datasets/binding_affinity_dataset/kd/enzyme_sequence_splits
 THRESHOLD=<threshold_folder_from_the_listing>
-/home/adhil/.conda/envs/mldb/bin/python emulator_bench/train_regression_tvt.py \
+$PY emulator_bench/train_regression_tvt.py \
   --value_type kd \
   --split_group enzyme_sequence_splits \
   --threshold $THRESHOLD \
@@ -30,4 +32,4 @@ THRESHOLD=<threshold_folder_from_the_listing>
 # Add --overwrite to run_split_benchmarks.py to retrain from scratch (no resume from checkpoint_last.pt).
 
 # 3. Aggregate seeds.
-/home/adhil/.conda/envs/mldb/bin/python emulator_bench/aggregate_bind_results.py
+$PY emulator_bench/aggregate_bind_results.py

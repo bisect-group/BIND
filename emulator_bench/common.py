@@ -15,6 +15,7 @@ EMULATOR_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATASETS_DIR = EMULATOR_ROOT / "data" / "processed" / "datasets"
 DEFAULT_OUTPUT_DIR = EMULATOR_ROOT / "outputs" / "baselines" / "BIND"
 DEFAULT_EMBEDDINGS_DIR = DEFAULT_OUTPUT_DIR / "embeddings"
+CACHE_VERSION = 3
 DEFAULT_SEEDS = [666, 777, 888]
 DATASET_PARENTS = {
     "ki": "kinetic_dataset",
@@ -58,20 +59,20 @@ def canonical_value_type(value: str) -> str:
     return mapping[normalized]
 
 
-def model_cache_tag(model_name: str, layer_indices: Sequence[int]) -> str:
+def model_cache_tag(model_name: str, layer_indices: Sequence[int], protein_length_cap: int) -> str:
     safe_model = str(model_name).replace("/", "_").replace("-", "_")
     layer_tag = "-".join(str(int(index)) for index in layer_indices)
-    return f"{safe_model}_layers_{layer_tag}_cls_eos"
+    return f"{safe_model}_layers_{layer_tag}_cap_{int(protein_length_cap)}_cls_eos"
 
 
-def protein_cache_path(embeddings_dir: Path, sequence: str, model_name: str, layer_indices: Sequence[int]) -> Path:
+def protein_cache_path(embeddings_dir: Path, sequence: str, model_name: str, layer_indices: Sequence[int], protein_length_cap: int) -> Path:
     key = stable_hash(normalize_sequence(sequence))
-    return Path(embeddings_dir) / "proteins" / model_cache_tag(model_name, layer_indices) / key[:2] / f"{key}.npz"
+    return Path(embeddings_dir) / f"proteins_v{CACHE_VERSION}" / model_cache_tag(model_name, layer_indices, protein_length_cap) / key[:2] / f"{key}.npz"
 
 
 def ligand_cache_path(embeddings_dir: Path, smiles: str) -> Path:
     key = stable_hash(str(smiles).strip())
-    return Path(embeddings_dir) / "ligands" / "graph_v1" / key[:2] / f"{key}.npz"
+    return Path(embeddings_dir) / f"ligands_v{CACHE_VERSION}" / key[:2] / f"{key}.npz"
 
 
 def value_root(datasets_dir: Path, value_type: str) -> Path:
@@ -229,7 +230,7 @@ def discover_split_jobs(
                     {
                         "value_type": value_type,
                                                 "split_group": split_group,
-                        "split_name": split_group,
+                        "split_name": "all",
                         "difficulty": split_group,
                         "root_dir": str(group_dir),
                         "train_path": str(train_path),

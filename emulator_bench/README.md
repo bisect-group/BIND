@@ -32,13 +32,14 @@ See `REPORT.md` for the sources and the paper-versus-code differences.
 
 - `cache_embeddings.py`, `launch_parallel_cache_embeddings.py`: build the shared protein and ligand cache.
 - `train_regression_tvt.py`: train and evaluate one task on one split with one seed.
-- `run_split_benchmarks.py`: run all discovered splits and seeds (default seeds 666 777 888), optionally over many GPUs.
+- `run_split_benchmarks.py`: run all discovered splits and seeds (default seeds 666 777 888), optionally over many GPUs (`--gpus 0 1 --runs_per_gpu 2`). `--amp` switches the fp16 default to bf16.
 - `aggregate_bind_results.py`: mean and variance over seeds.
 
 ## Paths
 
 - `--datasets_dir`: default `<EMULaToR>/data/processed/datasets`.
 - `--embeddings_dir`: default `<EMULaToR>/outputs/baselines/BIND/embeddings`.
-- `--output_dir`: default `<EMULaToR>/outputs/baselines/BIND/bind_results`. Each run writes to `<value_type>/<split_group>/<split_name>/seed_<N>`.
+- `--output_dir`: default `<EMULaToR>/outputs/baselines/BIND`. Each run writes to `<value_type>/<split_group>/<split_name>/seed_<N>`. `<split_name>` is `all` for flat split groups. Summaries go to `<output_dir>/summaries` and `<output_dir>/aggregate_bind_results.csv`.
+- The cache has `proteins_v3/<model>_layers_<ids>_cap_<protein_length_cap>_cls_eos/` and `ligands_v3/`. Change `CACHE_VERSION` in `common.py` to force a rebuild.
 
-Each run writes `bestmodel.pt`, `bestmodel_state_dict.pth`, `checkpoint_last.pt`, `final_results_{train,val,test}.csv`, `pred_label_{train,val,test}.csv`, `logfile.csv` and `run_summary.json`. A finished seed is skipped unless `--overwrite` is set. `--overwrite` also retrains from scratch and ignores `checkpoint_last.pt`. See `../commands.txt` for the commands.
+Each run writes `bestmodel.pth`, `bestmodel_state_dict.pth`, `checkpoint_last.pt`, `final_results_{train,val,test}.csv`, `pred_label_{train,val,test}.csv`, `logfile.csv` and `run_summary.json`. A finished seed is skipped unless `--overwrite` is set. `--overwrite` also retrains from scratch and ignores `checkpoint_last.pt`. See `../commands.txt` for the commands. Run them from `baselines/BIND`.

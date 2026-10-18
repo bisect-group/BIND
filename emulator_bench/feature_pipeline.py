@@ -176,6 +176,7 @@ class ProteinEmbeddingStore:
         embeddings_dir: Path,
         model_name: str,
         layer_indices: Sequence[int],
+        protein_length_cap: int,
         sequences: Optional[Sequence[str]] = None,
         preload: bool = False,
         max_items: int = 1024,
@@ -183,12 +184,13 @@ class ProteinEmbeddingStore:
         self.embeddings_dir = Path(embeddings_dir)
         self.model_name = model_name
         self.layer_indices = list(layer_indices)
+        self.protein_length_cap = int(protein_length_cap)
         self.max_items = max(1, int(max_items))
         self._cache: "OrderedDict[str, Dict[str, np.ndarray]]" = OrderedDict()
         if preload and sequences is not None:
             unique_sequences = sorted({normalize_sequence(sequence) for sequence in sequences})
             for sequence in unique_sequences:
-                path = protein_cache_path(self.embeddings_dir, sequence, model_name=self.model_name, layer_indices=self.layer_indices)
+                path = protein_cache_path(self.embeddings_dir, sequence, self.model_name, self.layer_indices, self.protein_length_cap)
                 if not path.exists():
                     raise FileNotFoundError(f"Missing cached protein embedding: {path}")
                 self._cache[sequence] = load_npz(path)
@@ -199,7 +201,7 @@ class ProteinEmbeddingStore:
             self._cache.move_to_end(normalized)
             return self._cache[normalized]
 
-        path = protein_cache_path(self.embeddings_dir, normalized, model_name=self.model_name, layer_indices=self.layer_indices)
+        path = protein_cache_path(self.embeddings_dir, normalized, self.model_name, self.layer_indices, self.protein_length_cap)
         if not path.exists():
             raise FileNotFoundError(f"Missing cached protein embedding: {path}")
         item = load_npz(path)

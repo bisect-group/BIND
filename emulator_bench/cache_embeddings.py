@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from emulator_bench.common import (
+    CACHE_VERSION,
     DEFAULT_DATASETS_DIR,
     DEFAULT_EMBEDDINGS_DIR,
     DEFAULT_HIDDEN_STATE_INDICES,
@@ -152,6 +153,7 @@ def cache_proteins(args, sequences):
             sequence,
             model_name=args.protein_model_name,
             layer_indices=args.hidden_state_indices,
+            protein_length_cap=args.protein_length_cap,
         ).exists()
     ]
     if not pending:
@@ -205,6 +207,7 @@ def cache_proteins(args, sequences):
                         sequence,
                         model_name=args.protein_model_name,
                         layer_indices=args.hidden_state_indices,
+                        protein_length_cap=args.protein_length_cap,
                     ),
                     protein_cache_item(
                         sequence,
@@ -333,7 +336,7 @@ def main():
     ligand_stats = cache_ligands(args, smiles_values)
 
     manifest = {
-        "cache_version": 2,
+        "cache_version": CACHE_VERSION,
         "datasets_dir": str(args.datasets_dir),
         "embeddings_dir": str(args.embeddings_dir),
         "value_types": list(args.value_types),

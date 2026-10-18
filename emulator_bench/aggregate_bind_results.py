@@ -31,7 +31,7 @@ def load_seed_results(seed_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR / "bind_results")
+    parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     args = parser.parse_args()
 
     rows = []

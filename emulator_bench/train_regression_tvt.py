@@ -287,6 +287,7 @@ def _existing_cache_mask(frame, embeddings_dir, args):
             sequence,
             model_name=args.protein_model_name,
             layer_indices=args.hidden_state_indices,
+            protein_length_cap=args.protein_length_cap,
         ).exists()
     )
     ligand_exists = smiles.map(lambda smiles_value: ligand_cache_path(embeddings_dir, smiles_value).exists())
@@ -330,7 +331,7 @@ def _filter_frame(frame, split_name: str, embeddings_dir: Path, args, model_sequ
 def main():
     parser = argparse.ArgumentParser(description="Train BIND regression on explicit train/val/test split files.")
     parser.add_argument("--datasets_dir", type=str, default=str(DEFAULT_DATASETS_DIR))
-    parser.add_argument("--output_dir", type=str, default=str(DEFAULT_OUTPUT_DIR / "bind_results"))
+    parser.add_argument("--output_dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--value_type", type=str, default=None)
     parser.add_argument("--split_group", type=str, default=None)
     parser.add_argument("--threshold", type=str, default=None)
@@ -458,6 +459,7 @@ def main():
         embeddings_dir,
         model_name=args.protein_model_name,
         layer_indices=args.hidden_state_indices,
+        protein_length_cap=args.protein_length_cap,
         sequences=all_sequences.tolist(),
         preload=args.preload_proteins,
         max_items=args.protein_cache_items,
@@ -508,7 +510,7 @@ def main():
     criterion = nn.HuberLoss(delta=args.huber_delta, reduction="mean")
 
     log_path = out_dir / "logfile.csv"
-    best_checkpoint_path = out_dir / "bestmodel.pt"
+    best_checkpoint_path = out_dir / "bestmodel.pth"
     best_state_dict_path = out_dir / "bestmodel_state_dict.pth"
     last_checkpoint_path = out_dir / "checkpoint_last.pt"
     run_summary_path = out_dir / "run_summary.json"
