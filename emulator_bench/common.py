@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import random
+import shutil
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -16,7 +17,7 @@ DEFAULT_DATASETS_DIR = EMULATOR_ROOT / "data" / "processed" / "datasets"
 DEFAULT_OUTPUT_DIR = EMULATOR_ROOT / "outputs" / "baselines" / "BIND"
 DEFAULT_EMBEDDINGS_DIR = DEFAULT_OUTPUT_DIR / "embeddings"
 CACHE_VERSION = 3
-PROTEIN_CACHE_VERSION = 4
+PROTEIN_CACHE_VERSION = 5
 DEFAULT_SEEDS = [666, 777, 888]
 DATASET_PARENTS = {
     "ki": "kinetic_dataset",
@@ -66,9 +67,18 @@ def model_cache_tag(model_name: str, layer_indices: Sequence[int], protein_lengt
     return f"{safe_model}_layers_{layer_tag}_cap_{int(protein_length_cap)}_cls_eos"
 
 
+def protein_cache_dir(embeddings_dir: Path, model_name: str, layer_indices: Sequence[int], protein_length_cap: int) -> Path:
+    return Path(embeddings_dir) / f"proteins_v{PROTEIN_CACHE_VERSION}" / model_cache_tag(model_name, layer_indices, protein_length_cap)
+
+
+def reset_protein_cache(embeddings_dir: Path, model_name: str, layer_indices: Sequence[int], protein_length_cap: int) -> None:
+    """Delete the protein cache directory of one model, layer and cap setting."""
+    shutil.rmtree(protein_cache_dir(embeddings_dir, model_name, layer_indices, protein_length_cap), ignore_errors=True)
+
+
 def protein_cache_path(embeddings_dir: Path, sequence: str, model_name: str, layer_indices: Sequence[int], protein_length_cap: int) -> Path:
     key = stable_hash(normalize_sequence(sequence))
-    return Path(embeddings_dir) / f"proteins_v{PROTEIN_CACHE_VERSION}" / model_cache_tag(model_name, layer_indices, protein_length_cap) / key[:2] / f"{key}.npy"
+    return protein_cache_dir(embeddings_dir, model_name, layer_indices, protein_length_cap) / key[:2] / f"{key}.npy"
 
 
 def ligand_cache_path(embeddings_dir: Path, smiles: str) -> Path:

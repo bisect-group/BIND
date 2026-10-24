@@ -1,3 +1,4 @@
+import os
 import zipfile
 import zlib
 from collections import OrderedDict
@@ -18,10 +19,13 @@ if str(REPO_ROOT) not in sys.path:
 
 import loading
 from data import BondType
-from emulator_bench.common import ligand_cache_path, normalize_sequence, protein_cache_path
+from emulator_bench.common import ligand_cache_path, normalize_sequence, protein_cache_dir, protein_cache_path
 
 
 PROTEIN_MODEL_NAME = "facebook/esm2_t33_650M_UR50D"
+# ESM-2 rescales the embeddings of an input without <mask> tokens by 1 - 0.15 * 0.8 (token dropout).
+ESM_TOKEN_SCALE = 1 - 0.15 * 0.8
+ESM_EMBEDDING_FILE = "esm_embedding.npz"
 GRAPH_BOND_TYPES = [BondType.SINGLE, BondType.DOUBLE, BondType.TRIPLE, BondType.AROMATIC, BondType.NOT_CONNECTED]
 
 
@@ -94,6 +98,21 @@ def _extract_layers(hidden_states, layer_indices: Sequence[int], sequence_length
     return extracted
 
 
+def build_token_lut(tokenizer) -> np.ndarray:
+    """Byte value -> ESM-2 token id, so a sequence maps to ids without the tokenizer."""
+    lut = np.full(256, tokenizer.unk_token_id, dtype=np.uint8)
+    for token, token_id in tokenizer.get_vocab().items():
+        if len(token) == 1:
+            lut[ord(token)] = token_id
+    return lut
+
+
+def token_ids(sequence: str, lut: np.ndarray) -> np.ndarray:
+    """<cls>, residues, <eos> as uint8 ids."""
+    residues = lut[np.frombuffer(sequence.encode("ascii"), dtype=np.uint8)]
+    return np.concatenate([[0], residues, [2]]).astype(np.uint8)
+
+
 def _esm_forward(
     model,
     tokenizer,
@@ -102,10 +121,19 @@ def _esm_forward(
     device: torch.device,
     autocast_dtype=None,
 ) -> Dict[str, Dict[str, np.ndarray]]:
+    """Run ESM-2 and return the requested layers. Layer 0 must equal the rescaled token embedding."""
     encoded = tokenizer(list(sequences), padding="longest", truncation=False, return_tensors="pt")
     encoded = {key: value.to(device, non_blocking=True) for key, value in encoded.items()}
     with torch.no_grad(), _autocast_context(device, autocast_dtype):
         outputs = model(**encoded, output_hidden_states=True)
+    valid = encoded["attention_mask"].bool()
+    rebuilt = model.embeddings.word_embeddings.weight[encoded["input_ids"]] * ESM_TOKEN_SCALE
+    if not torch.equal(rebuilt[valid], outputs.hidden_states[0][valid]):
+        raise RuntimeError("ESM-2 layer 0 differs from the rescaled token embedding.")
+    lut = build_token_lut(tokenizer)
+    for batch_index, sequence in enumerate(sequences):
+        if not np.array_equal(token_ids(normalize_sequence(sequence), lut), encoded["input_ids"][batch_index, : len(sequence) + 2].cpu().numpy()):
+            raise RuntimeError("Token ids from the lookup table differ from the tokenizer.")
     embedded = {}
     for batch_index, sequence in enumerate(sequences):
         normalized = normalize_sequence(sequence)
@@ -142,9 +170,30 @@ def graph_cache_item(smiles: str) -> Dict[str, np.ndarray]:
     }
 
 
-def protein_cache_item(hidden_states: Sequence[np.ndarray], protein_dtype: str = "float32") -> np.ndarray:
-    """One array per protein, shape (layers, residues + 2, features), so it can be memory-mapped."""
-    return np.stack(hidden_states).astype(np.float16 if protein_dtype == "float16" else np.float32, copy=False)
+def protein_cache_item(hidden_states: Sequence[np.ndarray]) -> np.ndarray:
+    """One fp16 array per protein, shape (cached layers, residues + 2, features), so it can be memory-mapped."""
+    with np.errstate(over="ignore"):
+        stacked = np.stack(hidden_states).astype(np.float16)
+    if not np.isfinite(stacked).all():
+        raise ValueError("Hidden states overflow float16.")
+    return stacked
+
+
+def save_esm_embedding(embeddings_dir: Path, model_name: str, layer_indices: Sequence[int], protein_length_cap: int, table: np.ndarray, lut: np.ndarray) -> None:
+    path = protein_cache_dir(embeddings_dir, model_name, layer_indices, protein_length_cap) / ESM_EMBEDDING_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(f".{os.getpid()}.tmp.npz")
+    np.savez(tmp_path, table=table.astype(np.float32), lut=lut)
+    tmp_path.replace(path)
+
+
+def load_esm_embedding(embeddings_dir: Path, model_name: str, layer_indices: Sequence[int], protein_length_cap: int):
+    """Token embedding table (layer 0 source) and the byte-to-token-id table of the cache."""
+    path = protein_cache_dir(embeddings_dir, model_name, layer_indices, protein_length_cap) / ESM_EMBEDDING_FILE
+    if not path.exists():
+        raise FileNotFoundError(f"Missing {path}. Run cache_embeddings.py first.")
+    with np.load(path) as data:
+        return data["table"], data["lut"]
 
 
 def load_npz(path: Path) -> Dict[str, np.ndarray]:
@@ -158,7 +207,7 @@ def load_npz(path: Path) -> Dict[str, np.ndarray]:
 
 
 class ProteinEmbeddingStore:
-    """Memory-maps one .npy per protein. Workers share the OS page cache, so nothing is held per worker."""
+    """Memory-maps one .npy per protein (layers 10, 20, 30 in fp16). The OS page cache is shared by all runs."""
 
     def __init__(self, embeddings_dir: Path, model_name: str, layer_indices: Sequence[int], protein_length_cap: int):
         self.embeddings_dir = Path(embeddings_dir)

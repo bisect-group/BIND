@@ -182,7 +182,7 @@ def main():
     parser.add_argument("--max_residues", type=int, default=8192)
     parser.add_argument("--max_batch", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--micro_batch_size", type=int, default=16, help="Forwarded to train_regression_tvt.py. Set to 64 (the batch size) to disable chunking.")
+    parser.add_argument("--micro_batch_size", type=int, default=32, help="Forwarded to train_regression_tvt.py. Set to 64 (the batch size) to disable chunking.")
     parser.add_argument("--amp", action="store_true", help="Opt-in bf16 autocast and TF32 on Ampere+ (default: the original fp16 autocast for training, fp32 ESM-2 caching).")
     args = parser.parse_args()
 

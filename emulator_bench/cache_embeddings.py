@@ -1,13 +1,16 @@
 import argparse
+import json
 import logging
 import os
 import time
+import multiprocessing
 import warnings
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
 import torch
+import transformers
 try:
     from src.utils.rich_progress import progress
 except ModuleNotFoundError:
@@ -35,9 +38,12 @@ from emulator_bench.common import (
     ligand_cache_path,
     normalize_sequence,
     normalize_threshold_args,
+    protein_cache_dir,
     protein_cache_path,
     read_table,
+    reset_protein_cache,
     require_columns,
+    load_json,
     save_json,
     stable_hash,
     truncate_sequence,
@@ -45,11 +51,13 @@ from emulator_bench.common import (
 from emulator_bench.feature_pipeline import (
     PROTEIN_MODEL_NAME,
     build_esm_batches,
+    build_token_lut,
     esm_sequence_limit,
     graph_cache_item,
     load_esm2_model,
     protein_cache_item,
     resolve_amp_dtype,
+    save_esm_embedding,
     _esm_forward,
 )
 
@@ -76,6 +84,10 @@ def _save_npy(path: Path, array: np.ndarray) -> None:
     tmp_path.replace(path)
 
 
+def _save_protein(path: Path, hidden_states) -> None:
+    _save_npy(path, protein_cache_item(hidden_states))
+
+
 class AsyncNpzWriter:
     def __init__(self, max_workers: int = 8, max_pending: int = 64):
         self.max_workers = max(1, int(max_workers))
@@ -84,7 +96,7 @@ class AsyncNpzWriter:
         self._pending = set()
 
     def submit(self, path: Path, item) -> None:
-        future = self._executor.submit(_save_npy if isinstance(item, np.ndarray) else _save_npz, path, item)
+        future = self._executor.submit(_save_protein if isinstance(item, list) else _save_npz, path, item)
         self._pending.add(future)
         self._drain_if_needed()
 
@@ -137,6 +149,42 @@ def _apply_shard(items, num_shards: int, shard_index: int):
     return shard_items
 
 
+def _check_cache_config(args, precision_mode: str, model_revision: str = "") -> str:
+    """Pin the settings that change stored values. A resumed build must use the same settings.
+
+    --overwrite first deletes the old entries, so a crashed rebuild never leaves them beside the new config.
+    Sharded workers skip the deletion because the launcher does it once before they start."""
+    config = {
+        "protein_cache_version": PROTEIN_CACHE_VERSION,
+        "protein_model_name": args.protein_model_name,
+        "protein_model_revision": model_revision,
+        "transformers_version": transformers.__version__,
+        "hidden_state_indices": args.hidden_state_indices,
+        "protein_length_cap": int(args.protein_length_cap),
+        "dtype": "float16",
+        "precision_mode": precision_mode,
+    }
+    path = protein_cache_dir(args.embeddings_dir, args.protein_model_name, args.hidden_state_indices, args.protein_length_cap) / "cache_config.json"
+    if path.exists() and not args.overwrite and load_json(path) != config:
+        raise RuntimeError(f"{path} holds different settings. Use the same settings or pass --overwrite.")
+    if args.overwrite and int(args.num_shards) == 1:
+        reset_protein_cache(args.embeddings_dir, args.protein_model_name, args.hidden_state_indices, args.protein_length_cap)
+    if not path.exists() or args.overwrite:
+        tmp_path = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.write_text(json.dumps(config, sort_keys=True))
+        tmp_path.replace(path)
+    return stable_hash(json.dumps(config, sort_keys=True))
+
+
+def _entry_is_valid(path: Path, sequence: str, layers: int, width: int) -> bool:
+    """True when the file loads and holds the expected (layers, residues + cls/eos, width) array."""
+    try:
+        return np.load(path, mmap_mode="r").shape == (layers, len(sequence) + 2, width)
+    except (OSError, ValueError, EOFError):
+        return False
+
+
 def cache_proteins(args, sequences):
     if not sequences:
         return {"proteins_total": 0, "proteins_written": 0, "proteins_skipped_long": 0}
@@ -145,6 +193,15 @@ def cache_proteins(args, sequences):
     autocast_dtype, precision_mode = resolve_amp_dtype(device, args.amp)
     model, tokenizer = load_esm2_model(device, model_name=args.protein_model_name)
     model_limit = esm_sequence_limit(model)
+    config_fingerprint = _check_cache_config(args, precision_mode, getattr(model.config, "_commit_hash", None) or "")
+    save_esm_embedding(
+        args.embeddings_dir,
+        args.protein_model_name,
+        args.hidden_state_indices,
+        args.protein_length_cap,
+        model.embeddings.word_embeddings.weight.detach().cpu().numpy(),
+        build_token_lut(tokenizer),
+    )
     if args.long_sequence_strategy == "drop":
         allowed = [sequence for sequence in sequences if len(sequence) <= model_limit]
         skipped_long = len(sequences) - len(allowed)
@@ -157,13 +214,18 @@ def cache_proteins(args, sequences):
         sequence
         for sequence in sharded_allowed
         if args.overwrite
-        or not protein_cache_path(
-            args.embeddings_dir,
+        or not _entry_is_valid(
+            protein_cache_path(
+                args.embeddings_dir,
+                sequence,
+                model_name=args.protein_model_name,
+                layer_indices=args.hidden_state_indices,
+                protein_length_cap=args.protein_length_cap,
+            ),
             sequence,
-            model_name=args.protein_model_name,
-            layer_indices=args.hidden_state_indices,
-            protein_length_cap=args.protein_length_cap,
-        ).exists()
+            len(args.hidden_state_indices) - 1,
+            model.config.hidden_size,
+        )
     ]
     if not pending:
         print("Protein cache is already complete.")
@@ -172,6 +234,7 @@ def cache_proteins(args, sequences):
             "proteins_written": 0,
             "proteins_skipped_long": skipped_long,
             "precision_mode": precision_mode,
+            "config_fingerprint": config_fingerprint,
             "model_sequence_limit": model_limit,
             "shard_index": int(args.shard_index),
             "num_shards": int(args.num_shards),
@@ -205,7 +268,7 @@ def cache_proteins(args, sequences):
                 model,
                 tokenizer,
                 batch,
-                layer_indices=args.hidden_state_indices,
+                layer_indices=args.hidden_state_indices[1:],
                 device=device,
                 autocast_dtype=autocast_dtype,
             )
@@ -218,10 +281,7 @@ def cache_proteins(args, sequences):
                         layer_indices=args.hidden_state_indices,
                         protein_length_cap=args.protein_length_cap,
                     ),
-                    protein_cache_item(
-                        [embedded[sequence][f"layer_{index}"] for index in args.hidden_state_indices],
-                        protein_dtype=args.protein_dtype,
-                    ),
+                    [embedded[sequence][f"layer_{index}"] for index in args.hidden_state_indices[1:]],
                 )
                 written += 1
             iterator.set_postfix(written=written, remaining=len(pending) - written)
@@ -236,10 +296,20 @@ def cache_proteins(args, sequences):
         "proteins_written": written,
         "proteins_skipped_long": skipped_long,
         "precision_mode": precision_mode,
+        "config_fingerprint": config_fingerprint,
         "model_sequence_limit": model_limit,
         "shard_index": int(args.shard_index),
         "num_shards": int(args.num_shards),
     }
+
+
+def _write_ligand(job):
+    path, smiles = job
+    try:
+        _save_npz(path, graph_cache_item(smiles))
+    except Exception as exc:
+        return smiles, str(exc)
+    return smiles, None
 
 
 def cache_ligands(args, smiles_values):
@@ -260,16 +330,17 @@ def cache_ligands(args, smiles_values):
 
     written = 0
     failed = []
-    iterator = progress(pending, desc="Caching ligand graphs", unit="smiles")
-    for smiles in iterator:
-        try:
-            item = graph_cache_item(smiles)
-        except Exception as exc:
-            failed.append({"smiles": smiles, "error": str(exc)})
-            continue
-        _save_npz(ligand_cache_path(args.embeddings_dir, smiles), item)
-        written += 1
-        iterator.set_postfix(written=written, failed=len(failed), remaining=len(pending) - written - len(failed))
+    jobs = [(ligand_cache_path(args.embeddings_dir, smiles), smiles) for smiles in pending]
+    workers = max(1, min(int(args.ligand_workers), len(jobs)))
+    chunksize = max(1, min(256, len(jobs) // (workers * 8)))
+    with multiprocessing.get_context("fork").Pool(workers) as pool:
+        iterator = progress(pool.imap_unordered(_write_ligand, jobs, chunksize), desc="Caching ligand graphs", unit="smiles", total=len(jobs))
+        for smiles, error in iterator:
+            if error is None:
+                written += 1
+            else:
+                failed.append({"smiles": smiles, "error": error})
+            iterator.set_postfix(written=written, failed=len(failed), remaining=len(jobs) - written - len(failed))
     if failed:
         save_json(args.embeddings_dir / "ligand_cache_failures.json", {"failures": failed})
     return {
@@ -299,9 +370,9 @@ def main():
     parser.add_argument("--max_residues", type=int, default=8192)
     parser.add_argument("--max_batch", type=int, default=8)
     parser.add_argument("--sliding_window_stride", type=int, default=896)
-    parser.add_argument("--protein_dtype", choices=["float16", "float32"], default="float32")
     parser.add_argument("--amp", action="store_true", help="Opt-in bf16 autocast (default: the original fp16 autocast for training, fp32 ESM-2 caching).")
     parser.add_argument("--writer_threads", type=int, default=max(4, min(16, os.cpu_count() or 4)))
+    parser.add_argument("--ligand_workers", type=int, default=max(1, min(16, os.cpu_count() or 1)))
     parser.add_argument("--max_pending_writes", type=int, default=128)
     parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--shard_index", type=int, default=0)
@@ -311,6 +382,8 @@ def main():
     args.datasets_dir = Path(args.datasets_dir)
     args.embeddings_dir = Path(args.embeddings_dir)
     args.hidden_state_indices = [int(index) for index in args.hidden_state_indices]
+    if args.hidden_state_indices[0] != 0:
+        raise ValueError("--hidden_state_indices must start with 0: layer 0 is rebuilt from the token embedding.")
     args.thresholds = normalize_threshold_args(args.thresholds, args.threshold)
     if int(args.num_shards) <= 0:
         raise ValueError("--num_shards must be positive")
@@ -339,8 +412,8 @@ def main():
     print(f"Rows truncated to first {int(args.protein_length_cap)} residues: {truncated_count}")
     print(f"Unique smiles: {len(smiles_values)}")
 
+    ligand_stats = cache_ligands(args, smiles_values)  # before CUDA starts, so the fork pool is safe
     protein_stats = cache_proteins(args, sequences)
-    ligand_stats = cache_ligands(args, smiles_values)
 
     manifest = {
         "cache_version": CACHE_VERSION,
@@ -359,7 +432,7 @@ def main():
         "num_shards": int(args.num_shards),
         "shard_index": int(args.shard_index),
         "truncated_rows_to_cap": int(truncated_count),
-        "protein_dtype": args.protein_dtype,
+        "input_fingerprint": stable_hash("\n".join(sequences + smiles_values)),
         "protein_cache": protein_stats,
         "ligand_cache": ligand_stats,
         "elapsed_seconds": time.time() - started,

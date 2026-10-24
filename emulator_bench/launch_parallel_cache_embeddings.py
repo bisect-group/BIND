@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from emulator_bench.common import DEFAULT_DATASETS_DIR, DEFAULT_EMBEDDINGS_DIR, DEFAULT_HIDDEN_STATE_INDICES, DEFAULT_VALUE_TYPES
+from emulator_bench.common import DEFAULT_DATASETS_DIR, DEFAULT_EMBEDDINGS_DIR, DEFAULT_HIDDEN_STATE_INDICES, DEFAULT_VALUE_TYPES, reset_protein_cache
 
 
 CACHE_SCRIPT = REPO_ROOT / "emulator_bench" / "cache_embeddings.py"
@@ -46,8 +46,6 @@ def build_worker_command(args, shard_index: int):
         str(args.max_batch),
         "--sliding_window_stride",
         str(args.sliding_window_stride),
-        "--protein_dtype",
-        args.protein_dtype,
         "--writer_threads",
         str(args.writer_threads),
         "--max_pending_writes",
@@ -86,7 +84,6 @@ def main():
     parser.add_argument("--max_residues", type=int, default=8192)
     parser.add_argument("--max_batch", type=int, default=8)
     parser.add_argument("--sliding_window_stride", type=int, default=896)
-    parser.add_argument("--protein_dtype", choices=["float16", "float32"], default="float32")
     parser.add_argument("--amp", action="store_true", help="Opt-in bf16 autocast (default: the original fp16 autocast for training, fp32 ESM-2 caching).")
     parser.add_argument("--writer_threads", type=int, default=max(4, min(16, os.cpu_count() or 4)))
     parser.add_argument("--max_pending_writes", type=int, default=128)
@@ -97,6 +94,9 @@ def main():
     args.hidden_state_indices = [int(index) for index in args.hidden_state_indices]
     args.thresholds = args.thresholds or ([args.threshold] if args.threshold else None)
     args.num_shards = len(args.gpus)
+
+    if args.overwrite:
+        reset_protein_cache(Path(args.embeddings_dir), args.protein_model_name, args.hidden_state_indices, args.protein_length_cap)
 
     failures = []
     lock = threading.Lock()

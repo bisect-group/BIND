@@ -2,6 +2,7 @@ import argparse
 import datetime
 import gc
 import math
+import os
 import time
 from contextlib import nullcontext
 from functools import partial
@@ -44,16 +45,26 @@ from emulator_bench.common import (
     set_seed,
     truncate_sequence,
 )
-from emulator_bench.dataset import CachedBindDataset, ReplacementSampler, collate_bind_samples
+from emulator_bench.dataset import (
+    CachedBindDataset,
+    GatherLoader,
+    ReplacementSampler,
+    _normalize_metadata_value,
+    collate_bind_samples,
+)
 from emulator_bench.feature_pipeline import (
     LigandGraphStore,
     PROTEIN_MODEL_NAME,
     ProteinEmbeddingStore,
     esm_sequence_limit_from_pretrained,
+    load_esm_embedding,
     resolve_amp_dtype,
 )
 from emulator_bench.modeling import build_model
 
+
+# Chunk shapes change every step; expandable segments keep the caching allocator from fragmenting.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 MINIMIZE_METRICS = {"rmse", "mse", "mae", "loss"}
 PAPER_EFFECTIVE_EPOCHS = 10.365942049524907
@@ -101,17 +112,15 @@ def _prepare_batch(batch, device: torch.device):
     return batch.to(device)
 
 
-def _make_loader(dataset, loader_kwargs: dict, sampler=None):
-    return DataLoader(dataset, sampler=sampler, **loader_kwargs)
+def _make_loader(dataset, loader_kwargs: dict, protein_store, gather_threads: int, sampler=None):
+    loader = DataLoader(dataset, sampler=sampler, **loader_kwargs)
+    return GatherLoader(loader, protein_store, threads=gather_threads, pin=loader_kwargs["pin_memory"])
 
 
 def _shutdown_loader(loader) -> None:
     if loader is None:
         return
-    iterator = getattr(loader, "_iterator", None)
-    if iterator is not None and hasattr(iterator, "_shutdown_workers"):
-        iterator._shutdown_workers()
-        loader._iterator = None
+    loader.shutdown()
     del loader
     gc.collect()
 
@@ -140,7 +149,7 @@ def evaluate_loader(model, loader, device, criterion, target_head, autocast_dtyp
             for chunk in chunks:
                 chunk = _prepare_batch(chunk, device)
                 with _autocast_context(device, autocast_dtype):
-                    outputs = model(chunk.graphs, chunk.protein_layers, chunk.attention_mask)
+                    outputs = model(chunk)
                     prediction = outputs[target_head]
                     loss = criterion(prediction, chunk.targets)
                 rows = int(chunk.targets.shape[0])
@@ -201,7 +210,7 @@ def train_one_epoch(
         for chunk in chunks:
             chunk = _prepare_batch(chunk, device)
             with _autocast_context(device, autocast_dtype):
-                outputs = model(chunk.graphs, chunk.protein_layers, chunk.attention_mask)
+                outputs = model(chunk)
                 prediction = outputs[target_head]
                 loss = criterion(prediction, chunk.targets)
             rows = int(chunk.targets.shape[0])
@@ -299,7 +308,7 @@ def _default_out_dir(args, job):
     return seed_result_dir(args.output_dir, job, args.seed)
 
 
-def _existing_cache_mask(frame, embeddings_dir, args):
+def _cache_masks(frame, embeddings_dir, args):
     from emulator_bench.common import ligand_cache_path, protein_cache_path
 
     sequences = frame[args.sequence_col].astype(str).map(normalize_sequence)
@@ -314,7 +323,26 @@ def _existing_cache_mask(frame, embeddings_dir, args):
         ).exists()
     )
     ligand_exists = smiles.map(lambda smiles_value: ligand_cache_path(embeddings_dir, smiles_value).exists())
-    return protein_exists & ligand_exists
+    return protein_exists, ligand_exists
+
+
+def _with_train_mean_fallback(metadata, y_true, y_pred, no_ligand, args, train_mean, criterion, model_loss):
+    """Appends the no-ligand rows with the train mean as prediction. Returns rows, arrays and full-set metrics."""
+    metadata = list(metadata)
+    fallback_true = no_ligand[args.target_col].to_numpy(dtype=np.float32)
+    for _, row in no_ligand.iterrows():
+        entry = {key: _normalize_metadata_value(value) for key, value in row.items()}
+        entry["sequence"] = normalize_sequence(str(row[args.sequence_col]))
+        entry["smiles"] = str(row[args.smiles_col]).strip()
+        entry["prediction_source"] = "train_mean_fallback"
+        metadata.append(entry)
+    fallback_pred = np.full(len(no_ligand), train_mean, dtype=np.float32)
+    y_true = np.concatenate([y_true.reshape(-1), fallback_true])
+    y_pred = np.concatenate([y_pred.reshape(-1), fallback_pred])
+    fallback_loss = float(criterion(torch.from_numpy(fallback_pred), torch.from_numpy(fallback_true))) * len(no_ligand)
+    metrics = regression_metrics(y_true, y_pred)
+    metrics["loss"] = (model_loss * (len(y_true) - len(no_ligand)) + fallback_loss) / len(y_true)
+    return metadata, y_true, y_pred, metrics
 
 
 def _filter_frame(frame, split_name: str, embeddings_dir: Path, args, model_sequence_limit: int):
@@ -332,15 +360,18 @@ def _filter_frame(frame, split_name: str, embeddings_dir: Path, args, model_sequ
     truncated_rows = int((filtered["sequence_length"] < filtered["original_sequence_length"]).sum())
     if args.long_sequence_strategy == "drop":
         filtered = filtered.loc[filtered["sequence_length"] <= int(model_sequence_limit)].copy()
-    cached = _existing_cache_mask(filtered, embeddings_dir, args)
+    protein_exists, ligand_exists = _cache_masks(filtered, embeddings_dir, args)
+    cached = protein_exists & ligand_exists
+    no_ligand = filtered.loc[protein_exists & ~ligand_exists].reset_index(drop=True)
     rows_missing_cache = int((~cached).sum())
     filtered = filtered.loc[cached].copy()
     filtered.reset_index(drop=True, inplace=True)
-    return filtered, {
+    return filtered, no_ligand, {
         "split_name": split_name,
         "rows_input": int(len(frame)),
         "rows_dropped_nan": rows_dropped_nan,
         "rows_missing_cache": rows_missing_cache,
+        "rows_no_ligand": int(len(no_ligand)),
         "rows_after_filter": int(len(filtered)),
         "rows_truncated_to_cap": truncated_rows,
         "max_original_sequence_length": int(filtered["original_sequence_length"].max()) if len(filtered) else 0,
@@ -378,7 +409,7 @@ def main():
     parser.add_argument("--leaky_relu_negative_slope", type=float, default=0.01)
 
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--micro_batch_size", type=int, default=16, help="Rows per forward/backward chunk. One optimizer step still covers batch_size rows. Set to batch_size to disable chunking.")
+    parser.add_argument("--micro_batch_size", type=int, default=32, help="Rows per forward/backward chunk. One optimizer step still covers batch_size rows. Set to batch_size to disable chunking.")
     parser.add_argument("--grad_accumulation_steps", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=11)
     parser.add_argument("--train_budget_mode", choices=["paper_steps", "fixed_epochs", "fixed_optimizer_steps"], default="paper_steps")
@@ -404,6 +435,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument("--gather_threads", type=int, default=6, help="Threads that copy cached protein states into pinned memory.")
     parser.add_argument("--sharing_strategy", choices=["file_descriptor", "file_system"], default="file_system")
     parser.add_argument("--lazy_ligands", action="store_true")
     parser.add_argument("--preload_ligands", action="store_true")
@@ -450,21 +482,28 @@ def main():
     model_sequence_limit = esm_sequence_limit_from_pretrained(args.protein_model_name)
 
     embeddings_dir = Path(args.embeddings_dir)
-    train_df, train_filter = _filter_frame(train_df, "train", embeddings_dir, args, model_sequence_limit)
-    val_df, val_filter = _filter_frame(val_df, "val", embeddings_dir, args, model_sequence_limit)
-    test_df, test_filter = _filter_frame(test_df, "test", embeddings_dir, args, model_sequence_limit)
+    train_df, _, train_filter = _filter_frame(train_df, "train", embeddings_dir, args, model_sequence_limit)
+    val_df, _, val_filter = _filter_frame(val_df, "val", embeddings_dir, args, model_sequence_limit)
+    test_df, test_no_ligand, test_filter = _filter_frame(test_df, "test", embeddings_dir, args, model_sequence_limit)
 
     for info in (train_filter, val_filter, test_filter):
         print(f"{info['split_name']}: {info['rows_input']} rows, {info['rows_dropped_nan']} NaN, "
               f"{info['rows_missing_cache']} missing from cache, {info['rows_after_filter']} kept", flush=True)
+    # Rows without a ligand graph (e.g. one-atom ions, SMILES the parser rejects) are dropped from val;
+    # test keeps them with the train mean as prediction. Missing protein entries stay an error.
     for info in (val_filter, test_filter):
-        if info["rows_missing_cache"]:
+        missing_protein = info["rows_missing_cache"] - info["rows_no_ligand"]
+        if missing_protein:
             raise RuntimeError(
-                f"{info['rows_missing_cache']} {info['split_name']} rows are missing from the cache in "
+                f"{missing_protein} {info['split_name']} rows are missing from the cache in "
                 f"{embeddings_dir}. Run cache_embeddings.py first."
             )
     if train_df.empty or val_df.empty or test_df.empty:
         raise RuntimeError("One or more filtered splits are empty after applying cache and sequence-length checks.")
+
+    train_mean = float(train_df[args.target_col].mean())
+    print(f"val rows dropped (no ligand): {val_filter['rows_no_ligand']}; "
+          f"test rows with train-mean fallback (no ligand): {test_filter['rows_no_ligand']} (train mean {train_mean:.6f})", flush=True)
 
     all_smiles = pd.concat(
         [train_df[args.smiles_col], val_df[args.smiles_col], test_df[args.smiles_col]],
@@ -483,9 +522,10 @@ def main():
         preload=(args.preload_ligands and not args.lazy_ligands),
     )
 
-    train_dataset = CachedBindDataset(train_df, protein_store, ligand_store, args.sequence_col, args.smiles_col, args.target_col)
-    val_dataset = CachedBindDataset(val_df, protein_store, ligand_store, args.sequence_col, args.smiles_col, args.target_col)
-    test_dataset = CachedBindDataset(test_df, protein_store, ligand_store, args.sequence_col, args.smiles_col, args.target_col)
+    esm_table, token_lut = load_esm_embedding(embeddings_dir, args.protein_model_name, args.hidden_state_indices, args.protein_length_cap)
+    train_dataset = CachedBindDataset(train_df, ligand_store, token_lut, args.sequence_col, args.smiles_col, args.target_col)
+    val_dataset = CachedBindDataset(val_df, ligand_store, token_lut, args.sequence_col, args.smiles_col, args.target_col)
+    test_dataset = CachedBindDataset(test_df, ligand_store, token_lut, args.sequence_col, args.smiles_col, args.target_col)
 
     eval_loader_kwargs = {
         "batch_size": args.batch_size,
@@ -497,9 +537,10 @@ def main():
         eval_loader_kwargs["prefetch_factor"] = args.prefetch_factor
     loader_kwargs = dict(eval_loader_kwargs, persistent_workers=args.num_workers > 0)
 
-    train_loader = _make_loader(train_dataset, loader_kwargs, sampler=ReplacementSampler(len(train_dataset)))
+    train_loader = _make_loader(train_dataset, loader_kwargs, protein_store, args.gather_threads, sampler=ReplacementSampler(len(train_dataset)))
 
     model = build_model(
+        esm_table,
         cross_attention_dropout=args.cross_attention_dropout,
         leaky_relu_negative_slope=args.leaky_relu_negative_slope,
     ).to(device)
@@ -585,7 +626,7 @@ def main():
         ) or optimizer_steps_completed >= target_optimizer_steps
         val_metrics = {"loss": float("nan"), args.monitor_metric: float("nan")}
         if should_validate:
-            val_loader = _make_loader(val_dataset, eval_loader_kwargs)
+            val_loader = _make_loader(val_dataset, eval_loader_kwargs, protein_store, args.gather_threads)
             _val_true, _val_pred, val_metrics, _val_metadata = evaluate_loader(
                 model,
                 val_loader,
@@ -685,7 +726,7 @@ def main():
     best_checkpoint = torch.load(best_checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(best_checkpoint["model_state_dict"])
 
-    train_loader = _make_loader(train_dataset, eval_loader_kwargs)
+    train_loader = _make_loader(train_dataset, eval_loader_kwargs, protein_store, args.gather_threads)
     final_train_true, final_train_pred, final_train_metrics, final_train_metadata = evaluate_loader(
         model,
         train_loader,
@@ -697,7 +738,7 @@ def main():
         metric_name=args.monitor_metric,
     )
     _shutdown_loader(train_loader)
-    val_loader = _make_loader(val_dataset, eval_loader_kwargs)
+    val_loader = _make_loader(val_dataset, eval_loader_kwargs, protein_store, args.gather_threads)
     final_val_true, final_val_pred, final_val_metrics, final_val_metadata = evaluate_loader(
         model,
         val_loader,
@@ -709,7 +750,7 @@ def main():
         metric_name=args.monitor_metric,
     )
     _shutdown_loader(val_loader)
-    test_loader = _make_loader(test_dataset, eval_loader_kwargs)
+    test_loader = _make_loader(test_dataset, eval_loader_kwargs, protein_store, args.gather_threads)
     final_test_true, final_test_pred, final_test_metrics, final_test_metadata = evaluate_loader(
         model,
         test_loader,
@@ -721,6 +762,16 @@ def main():
         metric_name=args.monitor_metric,
     )
     _shutdown_loader(test_loader)
+    final_test_metadata = [dict(row, prediction_source="model") for row in final_test_metadata]
+    if len(test_no_ligand):
+        final_test_metadata, final_test_true, final_test_pred, final_test_metrics = _with_train_mean_fallback(
+            final_test_metadata, final_test_true, final_test_pred, test_no_ligand, args, train_mean, criterion,
+            final_test_metrics["loss"],
+        )
+        final_test_metrics[args.monitor_metric] = (
+            final_test_metrics["loss"] if args.monitor_metric == "loss"
+            else _monitor_metric_from_arrays(args.monitor_metric, final_test_true, final_test_pred)
+        )
 
     save_predictions(out_dir / "pred_label_train.csv", final_train_metadata, final_train_true, final_train_pred)
     save_predictions(out_dir / "pred_label_val.csv", final_val_metadata, final_val_true, final_val_pred)
@@ -739,7 +790,10 @@ def main():
         "precision_mode": precision_mode,
         "train_rows": int(len(train_df)),
         "val_rows": int(len(val_df)),
-        "test_rows": int(len(test_df)),
+        "test_rows": int(len(test_df) + len(test_no_ligand)),
+        "val_rows_dropped_no_ligand": val_filter["rows_no_ligand"],
+        "test_rows_train_mean_fallback": int(len(test_no_ligand)),
+        "train_mean": train_mean,
         "filters": [train_filter, val_filter, test_filter],
         "train_budget_mode": args.train_budget_mode,
         "paper_effective_epochs": float(args.paper_effective_epochs),
