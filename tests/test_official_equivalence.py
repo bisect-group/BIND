@@ -1,12 +1,16 @@
 """The patched BIND model must equal the official ConditionModel in fp64: predictions, loss and gradients.
 
-Both models read the same real ESM-2 hidden states (computed once on CPU in fp32, then cast to fp64), so the test
-checks the model maths and not fp16 cache storage. Layer 0 is the rescaled token embedding in fp64 for both models.
+Both models read the same ESM-2 hidden states (real ones computed once on CPU in fp32 when the weights and the Ki
+split are present, else random states of the same shape with <cls> and <eos> rows, as the cache holds them), cast to
+fp64, so the test checks the model maths and not fp16 cache storage. Layer 0 is the rescaled token embedding in fp64
+for both models. verify_equivalence.sh sets EMULATOR_SYNTHETIC_FIXTURE so every checkout runs the random states.
 """
 
+import os
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -31,7 +35,12 @@ BONDS = [BondType.SINGLE, BondType.DOUBLE, BondType.TRIPLE, BondType.AROMATIC, B
 BATCHES = [(6, 32), (5, 32), (9, 4)]
 PRED_RTOL, LOSS_RTOL, GRAD_RTOL, GRAD_FLOOR = 1e-10, 1e-10, 1e-9, 1e-6
 
-pytestmark = pytest.mark.skipif(not KI_SPLIT.exists(), reason="needs the Ki train split")
+SYNTHETIC_SMILES = [
+    "CCO", "c1ccccc1O", "CC(=O)O", "CCN", "C1CC1", "CC(C)C", "c1ccncc1", "CCOC(=O)C", "CC(=O)Nc1ccc(O)cc1",
+    "OC1CCCCC1", "CCS", "c1ccc2ccccc2c1", "CN(C)C=O", "ClCCl", "CC#N", "OCC(O)CO", "CC(C)CC(=O)O", "CCCCO", "c1ccsc1", "CC(N)C(=O)O",
+]  # fmt: skip
+ESM_IDS = {c: 4 + i for i, c in enumerate("LAGVSERTIDPKQNFYMHWCXBUZO")}  # ESM-2 token ids of the residues
+WIDTH, N_STATES, PAD_ID = 1280, 31, 1
 
 
 class _Fp64Torch:
@@ -60,21 +69,61 @@ def official_graph(smiles):
     return Data(x=torch.Tensor(x), edge_index=dense_to_sparse(torch.Tensor(a))[0], edge_features=torch.Tensor(e))
 
 
-@pytest.fixture(scope="module")
-def setup():
+def real_inputs():
+    """Frame, ESM-2 token table, token LUT and an encoder returning (input_ids, attention_mask, hidden states)."""
     from transformers import AutoModel, AutoTokenizer
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(PROTEIN_MODEL_NAME, local_files_only=True)
         esm = AutoModel.from_pretrained(PROTEIN_MODEL_NAME, local_files_only=True).eval()
     except OSError:
-        pytest.skip("ESM-2 650M is not cached")
-
+        return None
     frame = pd.read_parquet(KI_SPLIT)
     frame = frame[(frame["sequence"].str.len() <= 90) & frame["smiles"].str.len().between(8, 60)]
+
+    def encode(sequences):
+        encoded = tokenizer(sequences, padding="longest", return_tensors="pt")
+        with torch.no_grad():
+            states = [h.double() for h in esm(**encoded, output_hidden_states=True).hidden_states]
+        return encoded["input_ids"], encoded["attention_mask"], states
+
+    return frame, esm.embeddings.word_embeddings.weight.detach().double(), build_token_lut(tokenizer), encode
+
+
+def synthetic_inputs():
+    rng = np.random.default_rng(0)
+    n = len(SYNTHETIC_SMILES)
+    letters = np.array(list("ACDEFGHIKLMNPQRSTVWY"))
+    frame = pd.DataFrame(
+        {
+            "sequence": ["".join(rng.choice(letters, rng.integers(12, 40))) for _ in range(n)],
+            "smiles": SYNTHETIC_SMILES,
+            "log10_value": rng.normal(size=n),
+        }
+    )
+    table = torch.from_numpy(rng.standard_normal((33, WIDTH))).double()
+    lut = np.zeros(256, dtype=np.uint8)
+    for residue, token_id in ESM_IDS.items():
+        lut[ord(residue)] = token_id
+
+    def encode(sequences):
+        longest = max(map(len, sequences)) + 2
+        ids = torch.full((len(sequences), longest), PAD_ID, dtype=torch.long)
+        mask = torch.zeros(len(sequences), longest, dtype=torch.long)
+        for row, sequence in enumerate(sequences):
+            ids[row, : len(sequence) + 2] = torch.from_numpy(token_ids(sequence, lut)).long()
+            mask[row, : len(sequence) + 2] = 1
+        states = torch.from_numpy(rng.standard_normal((N_STATES, len(sequences), longest, WIDTH))).double()
+        return ids, mask, list(states)
+
+    return frame, table, lut, encode
+
+
+@pytest.fixture(scope="module")
+def setup():
+    inputs = None if os.environ.get("EMULATOR_SYNTHETIC_FIXTURE") or not KI_SPLIT.exists() else real_inputs()
+    frame, table, lut, encode = inputs or synthetic_inputs()
     frame = frame.drop_duplicates("sequence").iloc[: sum(rows for rows, _ in BATCHES)]
-    table = esm.embeddings.word_embeddings.weight.detach().double()
-    lut = build_token_lut(tokenizer)
 
     previous_dtype, previous_threads = torch.get_default_dtype(), torch.get_num_threads()
     torch.set_default_dtype(torch.float64)
@@ -86,10 +135,8 @@ def setup():
             part = frame.iloc[start : start + rows]
             start += rows
             sequences = [normalize_sequence(s) for s in part["sequence"]]
-            encoded = tokenizer(sequences, padding="longest", return_tensors="pt")
-            with torch.no_grad():
-                states = [h.double() for h in esm(**encoded, output_hidden_states=True).hidden_states]
-            states[0] = table[encoded["input_ids"]] * ESM_TOKEN_SCALE
+            input_ids, attention_mask, states = encode(sequences)
+            states[0] = table[input_ids] * ESM_TOKEN_SCALE
             targets = torch.tensor(part["log10_value"].to_numpy(), dtype=torch.float32).double()
             samples = [
                 {
@@ -111,7 +158,7 @@ def setup():
             official = {
                 "graph": Batch.from_data_list([official_graph(s) for s in part["smiles"]]),
                 "states": states,
-                "mask": encoded["attention_mask"],
+                "mask": attention_mask,
                 "targets": targets.unsqueeze(1),
             }
             batches.append((official, chunks))

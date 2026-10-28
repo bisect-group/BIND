@@ -47,3 +47,21 @@ See `REPORT.md` for the sources and the paper-versus-code differences.
 The trainer sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` unless it is already set. `--gather_threads` (default 6) sets the threads that fill pinned memory with protein states.
 
 Each run writes `bestmodel.pth`, `bestmodel_state_dict.pth`, `checkpoint_last.pt`, `final_results_{train,val,test}.csv`, `pred_label_{train,val,test}.csv`, `logfile.csv` and `run_summary.json`. A finished seed is skipped unless `--overwrite` is set. `--overwrite` also retrains from scratch and ignores `checkpoint_last.pt`. Checkpoints from the old code (`pool.pool.*` keys) do not load. Delete them before a rerun. See `../commands.txt` for the commands. Run them from `baselines/BIND`.
+
+## Verify equivalence
+
+Run `bash emulator_bench/verify_equivalence.sh` from `baselines/BIND` in the `mldb` conda env. It needs no private data, weights or GPU. The script fails if any test is skipped. Add `--gpu` to also run the GPU test.
+
+The CPU run uses random ESM-2 hidden states (with the `<cls>` and `<eos>` rows, as the cache holds them) and 20 synthetic ligands. It checks:
+
+- The patched model against the official `ConditionModel` in fp64. Predictions, loss and gradients agree to 1e-10, 1e-10 and 1e-9 (relative), in eval and train mode, with one chunk and with several chunks per batch.
+- Our model has one regression head per endpoint. The official `classifier_head` and `temperature` weights are not used, so the comparison drops them. The four regression heads are compared.
+- The batched LCM pooling and cross-attention against the per-graph code, and chunked gradients against the unchunked batch.
+- The fp16 protein cache round trip (error at most 2^-11 relative), the packed collate against the original padded batch (exact), and the model output with fp16 states against fp32 states (within 5e-3).
+- The parallel ligand cache against the serial build, and the train-mean fallback for test rows without a ligand graph.
+
+The GPU test trains the same toy rows with fp16 autocast and GradScaler (the production setting) and with fp32. The noise control is the production run with initial weights perturbed by one rounding of the production dtype (2**-11, fp16). Per step, the gap |production - fp32| must be at most 10 times the floor |perturbed production - production|. The same holds for the final RMSE. Step 0 is judged like every other step: its gap must be at most 10 times its floor. Each test prints `max gap`, `max floor` and `ratio`; run with `-s` to see the line. The GradScaler starts at 2**10 in the test, because the default 2**16 skips the first four steps of this toy run.
+
+Negative control: `emulator_bench/verify_equivalence.sh --negative-control` scales the weights of the compared (production) run by 1.05 and runs only the GPU tests. It exits 0 only if every GPU test fails, so a passing GPU test shows a bound too loose to catch a 5% error.
+
+Not exact: fp16 autocast, fp16 cache storage, and micro-batch chunking. They change the order and precision of rounding. The original code runs ESM-2 in fp32 and trains one 256-row batch per step.
