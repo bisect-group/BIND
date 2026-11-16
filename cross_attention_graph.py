@@ -24,7 +24,7 @@ class CrossAttentionGraphModule (nn.Module):
         self.dense1 = nn.Linear(node_feature_size, node_feature_size)
         self.ln2 = nn.LayerNorm(node_feature_size)
 
-    def forward(self, graph_nodes, graph_batch, conditioning_vector, conditioning_attention_mask):
+    def forward(self, graph_nodes, graph_batch, conditioning_vector, conditioning_attention_mask, return_attention_weights=False):
 
         unbatched_sequences = unbatch(graph_nodes, graph_batch)
 
@@ -55,9 +55,17 @@ class CrossAttentionGraphModule (nn.Module):
         k = self.k_dense(conditioning_vector)
         v = self.v_dense(conditioning_vector)
 
-        attn_output, av_attn = self.attention(q, k, v, key_padding_mask=conditioning_attention_mask, average_attn_weights=False)
+        attn_output, av_attn = self.attention(
+            q,
+            k,
+            v,
+            key_padding_mask=conditioning_attention_mask,
+            need_weights=return_attention_weights,
+            average_attn_weights=False,
+        )
 
-        av_attn = torch.mean(av_attn.detach(), dim=1)
+        if return_attention_weights:
+            av_attn = torch.mean(av_attn.detach(), dim=1)
 
         x = self.ln1(attn_output + batch_nodes)
 

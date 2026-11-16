@@ -1,0 +1,17 @@
+# Paper-run commands for BIND. emulator_bench/run.sh runs them. Run from baselines/BIND.
+# PY: python of the conda env (we used mldb). Defaults: splits <EMULaToR>/data/processed/datasets,
+# cache <EMULaToR>/outputs/baselines/BIND/embeddings, runs <EMULaToR>/outputs/baselines/BIND/<value_type>/<split_group>/<split_name>/seed_<N>.
+PY=python
+
+# Cache the ESM-2 states (fp32) and ligand graphs in two passes, as in the paper (resumable).
+$PY emulator_bench/launch_parallel_cache_embeddings.py --gpus 0 --value_types ki kd ec50
+$PY emulator_bench/launch_parallel_cache_embeddings.py --gpus 0 --value_types ic50
+
+# Train and evaluate: seeds 666 777 888, original fp16 autocast (default, no --amp), micro batch 32.
+$PY emulator_bench/run_split_benchmarks.py --skip_cache --value_types ki kd ec50 ic50 --gpus 0 --runs_per_gpu 1
+
+# Mean and variance over seeds (aggregate_bind_results.csv).
+$PY emulator_bench/aggregate_bind_results.py
+
+# One task, one split, one seed.
+$PY emulator_bench/train_regression_tvt.py --value_type kd --split_group uniprot_time_splits --seed 666 --device cuda:0

@@ -82,6 +82,8 @@ There is an IPython Notebook that you can open using Jupyter and/or other notebo
 
 If you want to train your own model, you need to download the BindingDB dataset or make your own. Because this dataset is large and not made by us, we provide a downsampled version of it in `examples/bindingdb_sample.json` as reference. You can run `train_graph.py` to initiate training, and it'll default to running on this example file (change the location in `dataset.py` if you want to use another dataset). Note that the actual dataset we used had 2,749,266 unique protein-ligand entries, of which 2,469,626 were used for training the provided checkpoint. The heavily downsampled example file only has 1,000 and one unique protein, so you probably aren't going to get the best model from it alone.
 
+For split-driven EMULaToR retraining on `ki`, `kd`, `ic50`, and `ec50`, see `emulator_bench/README.md` and `commands.txt`.
+
 ### Evaluation and miscellaneous scripts from the paper
 
 The scripts used to calculate the success rates, etc., are in paper_eval_scripts. These scripts are just here for reference and are effectively vestigial in the code.
